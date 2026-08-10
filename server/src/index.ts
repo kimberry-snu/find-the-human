@@ -1,4 +1,4 @@
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import cors from "cors";
@@ -33,10 +33,77 @@ if (existsSync(clientIndex)) {
 }
 
 const httpServer = createServer(app);
+
+const clientOrigins = (process.env.CLIENT_ORIGIN ?? "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean)
+  .map((origin) => {
+    try {
+      return new URL(origin).origin;
+    } catch {
+      return origin.replace(/\/$/, "");
+    }
+  });
+const clientOriginSet = new Set(clientOrigins);
+const rateLimitsDisabled = process.env.RATE_LIMIT_DISABLED === "1";
+
+const firstHeaderValue = (value: string | string[] | undefined): string | undefined => {
+  const first = Array.isArray(value) ? value[0] : value?.split(",")[0];
+  return first?.trim() || undefined;
+};
+
+const clientIp = (request: IncomingMessage): string => {
+  const forwarded = firstHeaderValue(request.headers["x-forwarded-for"]);
+  const address = forwarded ?? request.socket.remoteAddress ?? "unknown";
+  return address.replace(/^::ffff:/, "").slice(0, 128);
+};
+
+const isAllowedRequestOrigin = (request: IncomingMessage): boolean => {
+  if (clientOriginSet.size === 0) return true;
+
+  const origin = firstHeaderValue(request.headers.origin);
+  if (!origin) return true;
+
+  let normalizedOrigin: string;
+  try {
+    normalizedOrigin = new URL(origin).origin;
+  } catch {
+    return false;
+  }
+  if (clientOriginSet.has(normalizedOrigin)) return true;
+
+  // A separately hosted client must be listed in CLIENT_ORIGIN. A client served
+  // by this Express process is same-origin and does not need to be duplicated.
+  const host = firstHeaderValue(request.headers["x-forwarded-host"]) ?? firstHeaderValue(request.headers.host);
+  if (!host) return false;
+  const protocol =
+    firstHeaderValue(request.headers["x-forwarded-proto"]) ??
+    ((request.socket as typeof request.socket & { encrypted?: boolean }).encrypted ? "https" : "http");
+
+  return normalizedOrigin === `${protocol}://${host}`;
+};
+
+const MAX_SOCKETS_PER_IP = 10;
+const activeSocketsByIp = new Map<string, number>();
+
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.CLIENT_ORIGIN?.split(",").map((origin) => origin.trim()).filter(Boolean) || true,
+    origin: clientOrigins.length > 0 ? clientOrigins : true,
     methods: ["GET", "POST"]
+  },
+  allowRequest: (request, callback) => {
+    if (!isAllowedRequestOrigin(request)) {
+      callback("허용되지 않은 출처입니다.", false);
+      return;
+    }
+
+    if (!rateLimitsDisabled && (activeSocketsByIp.get(clientIp(request)) ?? 0) >= MAX_SOCKETS_PER_IP) {
+      callback("IP당 동시에 최대 10개까지 연결할 수 있습니다.", false);
+      return;
+    }
+
+    callback(null, true);
   },
   maxHttpBufferSize: 16_384,
   pingTimeout: 20_000,
@@ -70,17 +137,114 @@ const perform = (socket: GameSocket, ack: Ack | undefined, action: () => void): 
   }
 };
 
+type RateLimitName = "room:create" | "room:access" | "chat:send";
+
+interface RateLimitPolicy {
+  limit: number;
+  windowMs: number;
+  message: (retryAfterSeconds: number) => string;
+}
+
+interface RateLimitBucket {
+  timestamps: number[];
+  lastSeenAt: number;
+  windowMs: number;
+}
+
+const rateLimitPolicies: Record<RateLimitName, RateLimitPolicy> = {
+  "room:create": {
+    limit: 3,
+    windowMs: 10 * 60_000,
+    message: (seconds) => `방 만들기 요청이 너무 많습니다. ${seconds}초 후 다시 시도해 주세요.`
+  },
+  "room:access": {
+    limit: 20,
+    windowMs: 60_000,
+    message: (seconds) => `방 참가 요청이 너무 많습니다. ${seconds}초 후 다시 시도해 주세요.`
+  },
+  "chat:send": {
+    limit: 5,
+    windowMs: 10_000,
+    message: (seconds) => `채팅을 너무 빠르게 보내고 있습니다. ${seconds}초 후 다시 시도해 주세요.`
+  }
+};
+
+const MAX_RATE_LIMIT_BUCKETS = 10_000;
+const rateLimitBuckets = new Map<string, RateLimitBucket>();
+
+const cleanRateLimitBuckets = (now = Date.now()): void => {
+  for (const [key, bucket] of rateLimitBuckets) {
+    if (bucket.lastSeenAt + bucket.windowMs <= now) rateLimitBuckets.delete(key);
+  }
+};
+
+const makeRoomForRateLimitBucket = (now: number): void => {
+  if (rateLimitBuckets.size < MAX_RATE_LIMIT_BUCKETS) return;
+  cleanRateLimitBuckets(now);
+  if (rateLimitBuckets.size < MAX_RATE_LIMIT_BUCKETS) return;
+
+  const oldestKey = rateLimitBuckets.keys().next().value as string | undefined;
+  if (oldestKey) rateLimitBuckets.delete(oldestKey);
+};
+
+const consumeRateLimit = (ip: string, name: RateLimitName): void => {
+  if (rateLimitsDisabled) return;
+
+  const now = Date.now();
+  const policy = rateLimitPolicies[name];
+  const key = `${name}:${ip}`;
+  const existing = rateLimitBuckets.get(key);
+  const timestamps = (existing?.timestamps ?? []).filter((timestamp) => timestamp > now - policy.windowMs);
+
+  if (timestamps.length >= policy.limit) {
+    const retryAfterSeconds = Math.max(1, Math.ceil(((timestamps[0] ?? now) + policy.windowMs - now) / 1_000));
+    if (existing) existing.lastSeenAt = now;
+    throw new Error(policy.message(retryAfterSeconds));
+  }
+
+  if (!existing) makeRoomForRateLimitBucket(now);
+  timestamps.push(now);
+  rateLimitBuckets.set(key, { timestamps, lastSeenAt: now, windowMs: policy.windowMs });
+};
+
+const rateLimitCleanupTimer = setInterval(cleanRateLimitBuckets, 60_000);
+rateLimitCleanupTimer.unref();
+
 io.on("connection", (socket: GameSocket) => {
+  const ip = clientIp(socket.request);
+  const activeSocketCount = activeSocketsByIp.get(ip) ?? 0;
+  if (!rateLimitsDisabled && activeSocketCount >= MAX_SOCKETS_PER_IP) {
+    socket.emit("error", { message: "IP당 동시에 최대 10개까지 연결할 수 있습니다." });
+    socket.disconnect(true);
+    return;
+  }
+  activeSocketsByIp.set(ip, activeSocketCount + 1);
+
+  socket.once("disconnect", () => {
+    const remaining = (activeSocketsByIp.get(ip) ?? 1) - 1;
+    if (remaining > 0) activeSocketsByIp.set(ip, remaining);
+    else activeSocketsByIp.delete(ip);
+  });
+
   socket.on("room:create", (payload: { nickname?: unknown } = {}, ack?: Ack) => {
-    respond(socket, ack, () => engine.createRoom(socket, payload.nickname));
+    respond(socket, ack, () => {
+      consumeRateLimit(ip, "room:create");
+      return engine.createRoom(socket, payload.nickname);
+    });
   });
 
   socket.on("room:join", (payload: { code?: unknown; nickname?: unknown } = {}, ack?: Ack) => {
-    respond(socket, ack, () => engine.joinRoom(socket, payload.code, payload.nickname));
+    respond(socket, ack, () => {
+      consumeRateLimit(ip, "room:access");
+      return engine.joinRoom(socket, payload.code, payload.nickname);
+    });
   });
 
   socket.on("room:rejoin", (payload: { playerId?: unknown; code?: unknown } = {}, ack?: Ack) => {
-    respond(socket, ack, () => engine.rejoinRoom(socket, payload.playerId, payload.code));
+    respond(socket, ack, () => {
+      consumeRateLimit(ip, "room:access");
+      return engine.rejoinRoom(socket, payload.playerId, payload.code);
+    });
   });
 
   socket.on(
@@ -91,7 +255,10 @@ io.on("connection", (socket: GameSocket) => {
   );
 
   socket.on("chat:send", (payload: { text?: unknown } = {}, ack?: Ack) => {
-    perform(socket, ack, () => engine.sendChat(socket, payload.text));
+    perform(socket, ack, () => {
+      consumeRateLimit(ip, "chat:send");
+      engine.sendChat(socket, payload.text);
+    });
   });
 
   socket.on("vote:cast", (payload: { targetAnonName?: unknown } = {}, ack?: Ack) => {
@@ -112,6 +279,7 @@ httpServer.listen(Number.isFinite(port) ? port : 3000, "0.0.0.0", () => {
 });
 
 const shutdown = (): void => {
+  clearInterval(rateLimitCleanupTimer);
   io.close(() => {
     httpServer.close(() => process.exit(0));
   });

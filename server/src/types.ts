@@ -60,6 +60,8 @@ export interface RoomSettings {
 
 export interface Room {
   code: string;
+  createdAt: number;
+  lastActivityAt: number;
   hostId: string;
   humans: Map<string, HumanPlayer>;
   phase: Phase;

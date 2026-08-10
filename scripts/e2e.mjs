@@ -402,7 +402,7 @@ async function startGame(host, peers, settings) {
 }
 
 async function runNormalFlow(baseUrl, allProbes) {
-  console.log('\n[1/5] Normal room: create/join/start/chat/rejoin/vote/reveal/end/again');
+  console.log('\n[1/6] Normal room: create/join/start/chat/rejoin/vote/reveal/end/again');
   const host = new Probe('normal-host', baseUrl);
   const guest = new Probe('normal-guest', baseUrl);
   allProbes.push(host, guest);
@@ -764,6 +764,98 @@ async function runNormalFlow(baseUrl, allProbes) {
   return { host, guest: voteRejoin };
 }
 
+async function runSoloFlow(baseUrl, allProbes) {
+  console.log('\n[2/6] Solo room: one human plays a complete round with three AIs');
+  const solo = new Probe('solo-host', baseUrl);
+  allProbes.push(solo);
+  await solo.connect();
+
+  step('create a one-human room and start with exactly three AI participants');
+  await createRoom(solo, 'solo-e2e');
+  const started = await startGame(solo, [], {
+    aiCount: 3,
+    rounds: 1,
+    spectatorMode: false,
+  });
+  const [gameStart] = started.starts;
+  assertObject(gameStart, 'solo game:start');
+  assert.equal(gameStart.isSpectator, false);
+  assert.equal(typeof gameStart.yourAnonName, 'string');
+  assertParticipants(gameStart.participants, 4, 'solo game');
+  assert(gameStart.participants.includes(gameStart.yourAnonName));
+
+  step('send the solo human chat message and receive the server echo');
+  const chatText = `solo-e2e-${Date.now()}`;
+  const chatAfter = solo.mark();
+  solo.emit('chat:send', { text: chatText });
+  const chat = await solo.expect('chat:new', (payload) => payload?.text === chatText, {
+    after: chatAfter,
+    description: 'solo chat echo',
+  });
+  assert.equal(chat.from, gameStart.yourAnonName);
+
+  step('cast the solo human vote and complete reveal plus game over');
+  const votePhase = await solo.expect('phase:change', (payload) => payload?.phase === 'VOTE', {
+    after: started.marks.get(solo),
+    description: 'solo VOTE phase',
+  });
+  assertPhase(votePhase, 'VOTE');
+  const aiTarget = gameStart.participants.find((name) => name !== gameStart.yourAnonName);
+  assert.equal(typeof aiTarget, 'string');
+  await solo.emitAck(
+    'vote:cast',
+    { targetAnonName: aiTarget },
+    'solo vote:cast',
+  );
+
+  const revealAfter = solo.mark();
+  const [revealPhase, reveal] = await Promise.all([
+    solo.expect('phase:change', (payload) => payload?.phase === 'REVEAL', {
+      after: revealAfter,
+      description: 'solo REVEAL phase',
+    }),
+    solo.expect('vote:reveal', null, {
+      after: revealAfter,
+      description: 'solo vote:reveal',
+    }),
+  ]);
+  assertPhase(revealPhase, 'REVEAL');
+  assertVoteReveal(reveal, new Set(gameStart.participants));
+  assert.equal(reveal.items.length, 4, 'the solo human and all three AIs must vote');
+  assert(
+    reveal.items.some(
+      (item) => item.voter === gameStart.yourAnonName && item.target === aiTarget,
+    ),
+    'the solo human vote must be present in vote:reveal',
+  );
+
+  const [endPhase, gameOver] = await Promise.all([
+    solo.expect('phase:change', (payload) => payload?.phase === 'END', {
+      after: revealAfter,
+      description: 'solo END phase',
+    }),
+    solo.expect('game:over', null, {
+      after: revealAfter,
+      description: 'solo game:over',
+    }),
+  ]);
+  assertPhase(endPhase, 'END');
+  assertGameOver(gameOver, gameStart.participants);
+  assert.equal(
+    gameOver.reveal.filter((identity) => identity.isAI).length,
+    3,
+    'solo game must reveal exactly three AIs',
+  );
+  assert.deepEqual(
+    gameOver.reveal
+      .filter((identity) => !identity.isAI)
+      .map((identity) => identity.realNickname),
+    ['solo-e2e'],
+    'solo game must reveal the human nickname',
+  );
+  solo.close();
+}
+
 async function playThreeRoundAttempt({
   baseUrl,
   code,
@@ -982,7 +1074,7 @@ async function playThreeRoundAttempt({
 }
 
 async function runThreeRoundChecklistFlow(baseUrl, allProbes) {
-  console.log('\n[2/5] Checklist room: validation, host delegation, and three completed rounds');
+  console.log('\n[3/6] Checklist room: validation, host delegation, and three completed rounds');
   const originalHost = new Probe('round-original-host', baseUrl);
   const roomHost = new Probe('round-new-host', baseUrl);
   const duplicate = new Probe('round-duplicate', baseUrl);
@@ -1149,7 +1241,7 @@ async function runThreeRoundChecklistFlow(baseUrl, allProbes) {
 }
 
 async function runAutomaticEvictionFlow(baseUrl, allProbes) {
-  console.log('\n[3/5] Disconnect grace: host transfer and automatic identity reveal');
+  console.log('\n[4/6] Disconnect grace: host transfer and automatic identity reveal');
   const host = new Probe('eviction-host', baseUrl);
   const guest = new Probe('eviction-guest', baseUrl);
   allProbes.push(host, guest);
@@ -1240,7 +1332,7 @@ async function runAutomaticEvictionFlow(baseUrl, allProbes) {
 }
 
 async function runSpectatorFlow(baseUrl, allProbes) {
-  console.log('\n[4/5] Spectator room: one human watches an AI-only game');
+  console.log('\n[5/6] Spectator room: one human watches an AI-only game');
   const spectator = new Probe('spectator-host', baseUrl);
   allProbes.push(spectator);
   await spectator.connect();
@@ -1311,7 +1403,7 @@ async function runSpectatorFlow(baseUrl, allProbes) {
 }
 
 async function runRandomFlow(normalRoom) {
-  console.log('\n[5/5] Random AI count from the reset normal-room lobby');
+  console.log('\n[6/6] Random AI count from the reset normal-room lobby');
   const { host, guest } = normalRoom;
   step('start with aiCount=random and verify the hidden count obeys the server range');
   const started = await startGame(host, [guest], {
@@ -1511,6 +1603,7 @@ async function main() {
         PORT: String(port),
         OPENAI_API_KEY: '',
         GAME_TIME_SCALE,
+        RATE_LIMIT_DISABLED: '1',
         NODE_ENV: 'production',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1522,6 +1615,7 @@ async function main() {
     console.log(`[setup] Health check passed: ${health.trim() || 'HTTP 200'}`);
 
     const normalRoom = await runNormalFlow(baseUrl, probes);
+    await runSoloFlow(baseUrl, probes);
     await runThreeRoundChecklistFlow(baseUrl, probes);
     await runAutomaticEvictionFlow(baseUrl, probes);
     await runSpectatorFlow(baseUrl, probes);
@@ -1529,10 +1623,10 @@ async function main() {
 
     console.log('\nPASS: Socket.IO E2E contract completed successfully.');
     console.log(
-      '      normal/rejoin, exact three-round 2-human + 3-AI completion, validation guards,',
+      '      solo 1-human + 3-AI completion, normal/rejoin, exact three-round 2-human + 3-AI,',
     );
     console.log(
-      '      host delegation/automatic eviction, spectator completion, and random AI start verified.',
+      '      validation guards, host delegation/automatic eviction, spectator, and random AI verified.',
     );
   } catch (error) {
     console.error(`\nFAIL: ${error?.stack ?? error}`);

@@ -35,6 +35,12 @@ const AI_COOLDOWN = 8_000;
 const SILENCE_THRESHOLD = 15_000;
 const AI_START_GAP = 2_000;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const MAX_ROOMS = 100;
+const MAX_ROOM_OCCUPANTS = 10;
+const MAX_CHAT_HISTORY = 300;
+const ROOM_IDLE_TTL = 15 * 60_000;
+const ROOM_ABSOLUTE_TTL = 2 * 60 * 60_000;
+const ROOM_SWEEP_INTERVAL = 60_000;
 
 const activeGamePhase = (room: Room): boolean =>
   room.phase === "CHAT" || room.phase === "VOTE" || room.phase === "REVEAL";
@@ -71,15 +77,24 @@ const settingsAiCount = (value: unknown): AiSetting => {
 export class GameEngine {
   readonly rooms = new Map<string, Room>();
 
-  constructor(private readonly io: GameIo) {}
+  constructor(private readonly io: GameIo) {
+    const roomSweepTimer = setInterval(() => this.sweepRooms(), ROOM_SWEEP_INTERVAL);
+    roomSweepTimer.unref();
+  }
 
   createRoom(socket: GameSocket, rawNickname: unknown): { code: string; playerId: string } {
     this.ensureSocketIsFree(socket);
+    if (this.rooms.size >= MAX_ROOMS) {
+      throw new Error("현재 생성 가능한 방이 모두 찼습니다. 잠시 후 다시 시도해 주세요");
+    }
     const nickname = nicknameFor(rawNickname);
     const code = this.generateRoomCode();
     const player = this.createHuman(nickname, socket);
+    const now = Date.now();
     const room: Room = {
       code,
+      createdAt: now,
+      lastActivityAt: now,
       hostId: player.id,
       humans: new Map([[player.id, player]]),
       phase: "LOBBY",
@@ -106,6 +121,9 @@ export class GameEngine {
     this.ensureSocketIsFree(socket);
     const code = inviteCodeFor(rawCode);
     const room = this.requireRoom(code);
+    if (room.humans.size >= MAX_ROOM_OCCUPANTS) {
+      throw new Error("이 방은 최대 10명까지 참가할 수 있습니다");
+    }
     const nickname = nicknameFor(rawNickname);
     if ([...room.humans.values()].some((human) => human.nickname.localeCompare(nickname, undefined, { sensitivity: "accent" }) === 0)) {
       throw new Error("이미 사용 중인 닉네임입니다");
@@ -117,6 +135,7 @@ export class GameEngine {
       player.alive = false;
     }
     room.humans.set(player.id, player);
+    this.touchRoom(room);
     if (!room.hostId || !room.humans.get(room.hostId)?.connected) room.hostId = player.id;
     this.attachSocket(room, player, socket);
 
@@ -141,6 +160,7 @@ export class GameEngine {
     player.disconnectedAt = undefined;
     player.connected = true;
     player.socketId = socket.id;
+    this.touchRoom(room);
     this.attachSocket(room, player, socket);
 
     if (previousSocketId && previousSocketId !== socket.id) {
@@ -166,12 +186,12 @@ export class GameEngine {
     const aiCountSetting = settingsAiCount(payload.aiCount ?? room.settings.aiCount);
     const rounds = clampInt(payload.rounds, 1, 10, room.settings.rounds);
     const connectedHumans = [...room.humans.values()].filter((human) => human.connected);
-    const minimum = spectatorMode ? 1 : 2;
-    if (connectedHumans.length < minimum) {
-      throw new Error(spectatorMode ? "관전 모드는 1명 이상 필요합니다" : "게임 시작에는 인간 2명 이상이 필요합니다");
+    if (connectedHumans.length < 1) {
+      throw new Error(spectatorMode ? "관전 모드는 1명 이상 필요합니다" : "게임 시작에는 인간 1명 이상이 필요합니다");
     }
 
     room.settings = { aiCount: aiCountSetting, rounds, spectatorMode };
+    this.touchRoom(room);
     const randomMinimum = Math.min(8, Math.max(2, connectedHumans.length - 1));
     const randomMaximum = Math.min(8, Math.max(randomMinimum, connectedHumans.length + 2));
     room.resolvedAiCount = spectatorMode
@@ -248,6 +268,7 @@ export class GameEngine {
     const text = rawText.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").trim();
     if (!text) throw new Error("빈 메시지는 보낼 수 없습니다");
     if (codePointLength(text) > 140) throw new Error("메시지는 140자까지 보낼 수 있습니다");
+    this.touchRoom(room);
     this.publishChat(room, participant.anonName, text);
   }
 
@@ -266,6 +287,7 @@ export class GameEngine {
       target: target.anonName,
       reason: "그냥 제일 수상해"
     });
+    this.touchRoom(room);
   }
 
   again(socket: GameSocket): void {
@@ -285,6 +307,7 @@ export class GameEngine {
     room.lastReveal = undefined;
     room.eliminationHistory = [];
     room.winner = undefined;
+    this.touchRoom(room);
     for (const [id, human] of room.humans) {
       if (!human.connected) {
         if (human.disconnectTimer) clearTimeout(human.disconnectTimer);
@@ -310,6 +333,7 @@ export class GameEngine {
     player.connected = false;
     player.socketId = undefined;
     player.disconnectedAt = Date.now();
+    this.touchRoom(room);
     if (room.hostId === player.id) this.assignHost(room);
     this.emitRoomState(room);
 
@@ -455,6 +479,7 @@ export class GameEngine {
     room.winner = winner;
     room.phaseEndsAt = Date.now();
     room.questionCard = undefined;
+    this.touchRoom(room);
     this.emitPhase(room);
     this.io.to(room.code).emit("game:over", this.gameOverPayload(room));
     this.emitRoomState(room);
@@ -647,7 +672,11 @@ export class GameEngine {
   private publishChat(room: Room, from: string, text: string): void {
     const message = { from, text, ts: Date.now() };
     room.chats.push(message);
+    if (room.chats.length > MAX_CHAT_HISTORY) {
+      room.chats.splice(0, room.chats.length - MAX_CHAT_HISTORY);
+    }
     room.lastChatAt = message.ts;
+    room.lastActivityAt = message.ts;
     this.io.to(room.code).emit("chat:new", message);
   }
 
@@ -845,6 +874,28 @@ export class GameEngine {
     const combinations = ADJECTIVES.flatMap((adjective) => ANIMALS.map((animal) => `${adjective}${animal}`));
     if (count > combinations.length) throw new Error("참가자가 너무 많습니다");
     return shuffle(combinations).slice(0, count);
+  }
+
+  private touchRoom(room: Room): void {
+    room.lastActivityAt = Date.now();
+  }
+
+  private sweepRooms(): void {
+    const now = Date.now();
+    for (const room of this.rooms.values()) {
+      const absoluteExpired = now - room.createdAt >= ROOM_ABSOLUTE_TTL;
+      const idleExpired =
+        (room.phase === "LOBBY" || room.phase === "END") &&
+        now - room.lastActivityAt >= ROOM_IDLE_TTL;
+      if (!absoluteExpired && !idleExpired) continue;
+
+      this.io.to(room.code).emit("error", {
+        message: absoluteExpired
+          ? "방의 최대 이용 시간이 지나 종료되었습니다"
+          : "오랫동안 활동이 없어 방이 종료되었습니다"
+      });
+      this.destroyRoom(room);
+    }
   }
 
   private destroyRoom(room: Room): void {
