@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Production bundles
+client/dist/
+server/dist/
+dist/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+client/.env
+server/.env
+
+# Test output
+coverage/
+.vitest/
+playwright-report/
+test-results/
+
+# Runtime output
+*.log
+logs/
+*.pid
+
+# Tool caches
+.vite/
+*.tsbuildinfo
+.eslintcache
+
+# Editor and OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Railway local metadata
+.railway/

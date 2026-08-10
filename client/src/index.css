@@ -1,0 +1,271 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    font-synthesis: none;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html {
+    min-width: 320px;
+    min-height: 100%;
+    background: #07080b;
+  }
+
+  body {
+    min-width: 320px;
+    min-height: 100%;
+    margin: 0;
+    overflow-x: hidden;
+    background: #07080b;
+    font-family: theme('fontFamily.sans');
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  button,
+  input,
+  textarea {
+    font: inherit;
+  }
+
+  button {
+    touch-action: manipulation;
+  }
+
+  ::selection {
+    background: rgba(103, 232, 213, 0.28);
+    color: white;
+  }
+}
+
+.app-bg {
+  background-color: #07080b;
+  background-image:
+    radial-gradient(circle at 15% -10%, rgba(103, 232, 213, 0.055), transparent 34%),
+    radial-gradient(circle at 95% 30%, rgba(255, 93, 115, 0.045), transparent 34%),
+    linear-gradient(rgba(255, 255, 255, 0.012) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.012) 1px, transparent 1px);
+  background-size: auto, auto, 32px 32px, 32px 32px;
+}
+
+.chat-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  overscroll-behavior: contain;
+}
+
+.chat-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+
+.chat-scroll::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.typing-dot {
+  display: block;
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: currentColor;
+  color: rgba(255, 255, 255, 0.42);
+  animation: typing-bounce 1.05s ease-in-out infinite;
+}
+
+.flip-scene {
+  perspective: 1100px;
+}
+
+.flip-card {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  transform-style: preserve-3d;
+  transition: transform 800ms cubic-bezier(0.2, 0.75, 0.2, 1);
+}
+
+.flip-card.is-flipped {
+  transform: rotateY(180deg);
+}
+
+.flip-face {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 28px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.38);
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.flip-front::after,
+.flip-back::after {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  content: '';
+  background: linear-gradient(120deg, transparent 30%, rgba(255, 255, 255, 0.055), transparent 70%);
+  transform: translateX(-100%);
+  animation: card-sheen 1.8s 0.5s ease-out forwards;
+}
+
+.flip-back {
+  transform: rotateY(180deg);
+}
+
+.animate-message-in {
+  animation: message-in 260ms cubic-bezier(0.22, 0.8, 0.24, 1) both;
+}
+
+.animate-list-in {
+  animation: list-in 380ms cubic-bezier(0.22, 0.8, 0.24, 1) both;
+}
+
+.animate-toast-in {
+  animation: toast-in 320ms cubic-bezier(0.22, 0.8, 0.24, 1) both;
+}
+
+.animate-sheet-in {
+  animation: sheet-in 360ms cubic-bezier(0.16, 0.82, 0.26, 1) both;
+}
+
+.animate-verdict-in {
+  animation: verdict-in 430ms cubic-bezier(0.16, 0.82, 0.26, 1) both;
+}
+
+.animate-card-arrive {
+  animation: card-arrive 500ms cubic-bezier(0.16, 0.82, 0.26, 1) both;
+}
+
+.animate-result-pop {
+  animation: result-pop 700ms cubic-bezier(0.18, 0.9, 0.25, 1.3) both;
+}
+
+.animate-urgent {
+  animation: urgent 1s ease-in-out infinite;
+}
+
+@keyframes typing-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.35;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@keyframes message-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes list-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes sheet-in {
+  from {
+    opacity: 0;
+    transform: translateY(36px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes verdict-in {
+  from {
+    opacity: 0;
+    transform: translateX(-12px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+}
+
+@keyframes card-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(20px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes card-sheen {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes result-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.65) rotate(-8deg);
+  }
+  65% {
+    transform: scale(1.06) rotate(2deg);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) rotate(0);
+  }
+}
+
+@keyframes urgent {
+  50% {
+    box-shadow: 0 0 18px rgba(255, 93, 115, 0.2);
+    opacity: 0.74;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
