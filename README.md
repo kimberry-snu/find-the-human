@@ -59,7 +59,7 @@ Express + Socket.io 서버 (authoritative state machine)
 - 응답은 최대 30자로 후처리하고 15% 확률로 오타를 넣으며, 두 줄이면 0.7~1.5초 간격으로 나눠 전송
 - 투표는 채팅 생성과 분리된 JSON structured output 호출로 `{ target, reason }`을 받음
 
-OpenAI 호출에는 temperature `1.1`, max tokens `60`을 사용합니다. 키가 없거나 호출·검증이 실패하면 아래의 mock 경로로 즉시 이어집니다.
+OpenAI 호출에는 기본적으로 temperature `1.1`, max tokens `60`을 사용합니다. 단, 기본 temperature만 허용하는 GPT-5.6 계열은 `1`을 사용합니다. 키가 없거나 호출·검증이 실패하면 아래의 mock 경로로 즉시 이어집니다.
 
 ## 로컬 실행
 
