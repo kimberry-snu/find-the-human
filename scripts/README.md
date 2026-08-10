@@ -10,6 +10,7 @@ The harness builds the server, starts the compiled server on an ephemeral port,
 forces mock AI mode by clearing `OPENAI_API_KEY`, and sets
 `GAME_TIME_SCALE=0.06`. It verifies:
 
+- one human plus three AIs through start, chat, vote, reveal, and game over;
 - two humans plus three AIs through create, join, start, chat, vote, reveal,
   game over, and play again;
 - an exact two-human plus three-AI game completing all three rounds;

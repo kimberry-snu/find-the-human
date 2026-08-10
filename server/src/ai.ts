@@ -9,6 +9,7 @@ interface ChatCompletionResponse {
 }
 
 const model = (): string => process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+const temperature = (): number => model().startsWith("gpt-5.6") ? 1 : 1.1;
 
 const promptFor = (participant: Participant): string => {
   const persona = participant.persona;
@@ -132,7 +133,7 @@ export const generateAiChat = async (
     const questionContext = room.questionCard ? `\n이번 질문 카드: ${room.questionCard}` : "";
     const output = await requestOpenAI({
       model: model(),
-      temperature: 1.1,
+      temperature: temperature(),
       max_completion_tokens: 60,
       messages: [
         { role: "system", content: promptFor(participant) },
@@ -186,7 +187,7 @@ ${recentLog(room)}`;
     try {
       const output = await requestOpenAI({
         model: model(),
-        temperature: 1.1,
+        temperature: temperature(),
         max_completion_tokens: 60,
         response_format: {
           type: "json_schema",

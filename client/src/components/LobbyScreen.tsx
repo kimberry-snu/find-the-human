@@ -44,7 +44,7 @@ export function LobbyScreen({
 
   const isHost = hostId === playerId || players.some((player) => player.id === playerId && player.isHost);
   const connectedPlayers = players.filter((player) => player.connected);
-  const minimumPlayers = spectatorMode ? 1 : 2;
+  const minimumPlayers = 1;
   const canStart = isHost && connectedPlayers.length >= minimumPlayers && connected;
 
   const markTouched = () => setTouched(true);
@@ -92,7 +92,7 @@ export function LobbyScreen({
           </button>
         </div>
         <p className="mt-4 text-xs font-medium text-white/35">
-          친구에게 코드를 보내고, 모두 들어오면 게임을 시작하세요.
+          친구를 초대하거나, 혼자서 바로 AI와 게임을 시작하세요.
         </p>
       </section>
 
@@ -292,7 +292,11 @@ export function LobbyScreen({
               </p>
             ) : (
               <p className="mt-2.5 text-center text-[10px] font-semibold text-white/25">
-                시작하면 모두에게 새로운 익명 이름이 배정돼요
+                {spectatorMode
+                  ? '시작하면 AI들의 대화를 관전할 수 있어요'
+                  : connectedPlayers.length === 1
+                    ? '혼자서도 AI와 바로 시작할 수 있어요'
+                    : '시작하면 모두에게 새로운 익명 이름이 배정돼요'}
               </p>
             )}
           </div>

@@ -5,7 +5,7 @@
 ## 게임 규칙
 
 1. 방장이 방을 만들고 4자리 초대 코드를 공유합니다.
-2. 일반 게임은 인간 2명 이상, 관전 모드는 인간 1명 이상일 때 시작할 수 있습니다.
+2. 일반 게임과 관전 모드는 모두 인간 1명부터 시작할 수 있습니다. 일반 게임에서 혼자 입장하면 선택한 AI들과 바로 플레이합니다.
 3. 시작하면 인간과 AI 모두에게 `형용사+동물` 형식의 익명 이름이 배정됩니다. 실제 닉네임과 AI 여부는 공개 전까지 숨겨집니다.
 4. 각 라운드는 `CHAT → VOTE → REVEAL` 순서로 진행됩니다.
    - **CHAT (90초)**: 공개된 질문 카드를 소재로 자유롭게 대화합니다.
@@ -59,7 +59,7 @@ Express + Socket.io 서버 (authoritative state machine)
 - 응답은 최대 30자로 후처리하고 15% 확률로 오타를 넣으며, 두 줄이면 0.7~1.5초 간격으로 나눠 전송
 - 투표는 채팅 생성과 분리된 JSON structured output 호출로 `{ target, reason }`을 받음
 
-OpenAI 호출에는 temperature `1.1`, max tokens `60`을 사용합니다. 키가 없거나 호출·검증이 실패하면 아래의 mock 경로로 즉시 이어집니다.
+OpenAI 호출에는 기본적으로 temperature `1.1`, max tokens `60`을 사용합니다. 단, 기본 temperature만 허용하는 GPT-5.6 계열은 `1`을 사용합니다. 키가 없거나 호출·검증이 실패하면 아래의 mock 경로로 즉시 이어집니다.
 
 ## 로컬 실행
 
@@ -97,7 +97,7 @@ npm start
 | `npm run build` | client를 먼저 빌드한 뒤 server TypeScript 빌드 |
 | `npm start` | 빌드된 server를 단일 프로세스로 실행 |
 | `npm test` | 타입 검사 후 mock Socket.IO 전체 E2E 실행 |
-| `npm run test:e2e` | 임시 포트에서 서버를 띄워 5개 실시간 시나리오 실행 |
+| `npm run test:e2e` | 임시 포트에서 서버를 띄워 6개 실시간 시나리오 실행 |
 | `npm run typecheck` | 두 workspace의 TypeScript 검사 실행 |
 
 ## 환경 변수
@@ -109,7 +109,9 @@ npm start
 | `OPENAI_API_KEY` | 선택 | 빈 값 | 값이 없으면 mock 모드. 값이 있으면 실제 Chat Completions 호출 |
 | `OPENAI_MODEL` | 선택 | `gpt-4o-mini` | AI 채팅과 투표에 사용할 모델 |
 | `PORT` | 선택 | `3000` | Express/Socket.io 수신 포트. Railway가 배포 시 주입 |
+| `CLIENT_ORIGIN` | 선택 | 빈 값 | 분리 배포 시 허용할 브라우저 Origin. 여러 값은 쉼표로 구분 |
 | `GAME_TIME_SCALE` | 테스트 전용 | `1` | 페이즈·AI·재접속 타이머 배율. 실제 배포에서는 `1` 유지 |
+| `RATE_LIMIT_DISABLED` | E2E 전용 | 빈 값 | `1`이면 요청 제한 해제. 공개 배포에서는 설정 금지 |
 
 `.env`는 Git에서 제외됩니다. API 키를 클라이언트 변수나 브라우저 코드에 넣지 마세요.
 
@@ -131,11 +133,11 @@ mock 모드에서도 AI 발화 판단, typing 지연, 메시지 분할, 투표, 
 
 1. GitHub 저장소를 Railway 새 프로젝트의 서비스에 연결합니다.
 2. 서비스의 Root Directory는 저장소 루트로 둡니다.
-3. Variables에 실제 AI를 쓸 경우 `OPENAI_API_KEY`, 필요하면 `OPENAI_MODEL`을 등록합니다. `PORT`는 Railway가 자동 주입하므로 직접 고정하지 않는 편이 좋습니다.
+3. 첫 공개 데모는 `OPENAI_API_KEY`를 등록하지 않은 mock 모드가 안전합니다. 실제 AI를 쓸 때만 서버 Variables에 `OPENAI_API_KEY`, 필요하면 `OPENAI_MODEL`을 등록합니다. `PORT`는 Railway가 자동 주입하므로 직접 고정하지 않는 편이 좋습니다.
 4. 배포하면 Railway가 `npm install --include=dev && npm run build`를 실행하고 `npm start`로 서버 하나를 시작합니다.
 5. **Generate Domain**으로 공개 도메인을 만든 뒤 `/health`가 성공하는지 확인합니다.
 
-API 키 없이 배포하면 공개 데모용 mock 모드로 그대로 동작합니다. 방과 플레이어 정보는 메모리에만 있으므로 Railway replica는 반드시 1개로 유지해야 합니다. 재배포나 프로세스 재시작 시 진행 중인 방은 복구되지 않습니다.
+API 키 없이 배포하면 공개 데모용 mock 모드로 그대로 동작합니다. 공개 서버는 IP별 연결·방 생성·참가·채팅 속도를 제한하며, 방은 최대 10명, 서버 전체는 최대 100개 방을 유지합니다. 로비/종료 방은 15분 무활동 시, 모든 방은 최대 2시간 후 정리됩니다. 방과 플레이어 정보는 메모리에만 있으므로 Railway replica는 반드시 1개로 유지해야 합니다. 재배포나 프로세스 재시작 시 진행 중인 방은 복구되지 않습니다.
 
 ## GitHub Pages 배포
 
@@ -208,16 +210,16 @@ npm test
 npm run build
 ```
 
-`npm test`는 빈 OpenAI 키와 임시 포트, 축소된 테스트 타이머를 사용합니다. 일반 2인+AI 3명 3라운드, 재접속, 권한·입력 검증, 자동 추방, 관전 AI-only, 랜덤 AI 모드를 실제 Socket.IO 연결로 확인하고 자식 서버를 자동 정리합니다.
+`npm test`는 빈 OpenAI 키와 임시 포트, 축소된 테스트 타이머를 사용합니다. 일반 1인+AI 3명 및 2인+AI 3명 게임, 3라운드, 재접속, 권한·입력 검증, 자동 추방, 관전 AI-only, 랜덤 AI 모드를 실제 Socket.IO 연결로 확인하고 자식 서버를 자동 정리합니다.
 
 빌드 후 `npm start`를 실행하고 `http://localhost:3000/health`도 확인합니다.
 
 ### 핵심 수동 시나리오
 
 1. `OPENAI_API_KEY`를 비운 채 개발 서버를 시작합니다.
-2. 일반 창과 시크릿 창(또는 서로 다른 브라우저)에서 각각 닉네임을 입력합니다.
-3. 첫 창에서 방을 만들고 둘째 창에서 4자리 코드로 참가합니다.
-4. 방장이 AI 3명, 3라운드, 관전 모드 OFF로 시작합니다.
+2. 한 브라우저에서 방을 만든 뒤 AI 3명, 1라운드, 관전 모드 OFF로 혼자 시작해 전체 흐름을 확인합니다.
+3. 멀티플레이도 확인하려면 일반 창과 시크릿 창(또는 서로 다른 브라우저)에서 각각 닉네임을 입력합니다.
+4. 첫 창에서 방을 만들고 둘째 창에서 4자리 코드로 참가한 뒤, 방장이 AI 3명, 3라운드, 관전 모드 OFF로 시작합니다.
 5. 다음 항목을 끝까지 확인합니다.
    - 질문 카드와 서버 기준 타이머가 두 탭에서 같은 단계로 바뀌는가
    - AI가 typing을 보인 뒤 말하고, 가끔 오타 및 분할 메시지를 보내는가
