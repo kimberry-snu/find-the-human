@@ -2,7 +2,7 @@ import { CHAT_SYSTEM_PROMPT, MOCK_LINES, MOCK_REASONS } from "./content.js";
 import type { Participant, Room } from "./types.js";
 import { pick, sleep, truncateCodePoints } from "./utils.js";
 
-type ChatTrigger = "natural" | "question" | "mentioned";
+export type ChatTrigger = "natural" | "question" | "mentioned" | "interrogated" | "defense";
 
 interface ChatCompletionResponse {
   choices?: Array<{ message?: { content?: string | null } }>;
@@ -26,6 +26,8 @@ const promptFor = (participant: Participant): string => {
 const triggerText = (trigger: ChatTrigger): string => {
   if (trigger === "question") return "질문 카드에 아직 답 안 했다. 지금 답해라";
   if (trigger === "mentioned") return "방금 네가 지목당했다. 반응해라";
+  if (trigger === "interrogated") return "방금 심문당했다. 질문에 피하지 말고 짧은 반말 한 문장으로 바로 답해라";
+  if (trigger === "defense") return "네가 최다 득표자가 됐다. 억울함과 다른 참가자에 대한 역의심을 담아 짧은 반말 한 문장으로 최후 변론해라";
   return "지금 자연스럽게 끼어들어 한마디 해라";
 };
 
@@ -120,17 +122,25 @@ const cleanChatOutput = (raw: string): string[] => {
 export const generateAiChat = async (
   participant: Participant,
   room: Room,
-  trigger: ChatTrigger
+  trigger: ChatTrigger,
+  deadline = room.phaseEndsAt
 ): Promise<string[]> => {
   if (!process.env.OPENAI_API_KEY?.trim()) {
-    const first = trigger === "question"
-      ? mockQuestionAnswer(participant, room.questionCard)
-      : pick(MOCK_LINES);
+    if (trigger === "interrogated") {
+      return [pick(["뭘 또 증명해ㅋㅋ", "방금 말했잖아;;", "나보다 너가 더 수상함", "진짜 사람인데 억울하네"])];
+    }
+    if (trigger === "defense") {
+      return [pick(["나 뽑으면 진짜 후회함ㅋㅋ", "억울해 쟤가 더 수상해", "이걸 속네 다들;;", "잠깐 나 진짜 사람임"])];
+    }
+    const first = trigger === "question" ? mockQuestionAnswer(participant, room.questionCard) : pick(MOCK_LINES);
     return Math.random() < 0.3 ? [first, pick(MOCK_LINES)] : [first];
   }
 
   try {
     const questionContext = room.questionCard ? `\n이번 질문 카드: ${room.questionCard}` : "";
+    const interrogationContext = trigger === "interrogated" && room.interrogation
+      ? `\n심문 질문: ${room.interrogation.question}`
+      : "";
     const output = await requestOpenAI({
       model: model(),
       temperature: temperature(),
@@ -139,13 +149,15 @@ export const generateAiChat = async (
         { role: "system", content: promptFor(participant) },
         {
           role: "user",
-          content: `${recentLog(room)}${questionContext}\n\n${triggerText(trigger)}`
+          content: `${recentLog(room)}${questionContext}${interrogationContext}\n\n${triggerText(trigger)}`
         }
       ]
-    }, room.phaseEndsAt);
+    }, deadline);
     return cleanChatOutput(output);
   } catch (error) {
     console.warn(`[AI chat fallback] ${error instanceof Error ? error.message : String(error)}`);
+    if (trigger === "interrogated") return ["갑자기 그걸 왜물어ㅋㅋ"];
+    if (trigger === "defense") return ["나 아니라고 진짜 억울함;;"];
     return [trigger === "question" ? mockQuestionAnswer(participant, room.questionCard) : pick(MOCK_LINES)];
   }
 };
@@ -178,6 +190,7 @@ export const generateAiVote = async (
 인간으로 가장 의심되는 생존자 1명을 지목하라. 자기 자신은 지목 불가.
 생존자 목록: ${candidates.join(", ")}
 단서 예시: 너무 정중함, 너무 논리적임, 발화가 지나치게 적음, AI 흉내가 어색함, 반응이 부자연스러움.
+확신이 없으면 이번 라운드에 제일 시끄럽게 떠든 참가자를 지목해라.
 출력: {"target": "<생존자 익명닉>", "reason": "<25자 이내 한 줄, 반말>"}
 
 ${recentLog(room)}`;

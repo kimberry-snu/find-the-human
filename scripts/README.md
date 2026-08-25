@@ -33,3 +33,14 @@ node scripts/e2e.mjs
 On failure, the assertion includes the client's recent Socket.IO events and the
 tail of the child server output. All sockets and the child process are closed in
 a `finally` block.
+
+## Playtest win-rate summary
+
+Save the server's `game_complete` JSON lines to a log file, then run:
+
+```powershell
+npm run metrics:playtest -- render.log
+```
+
+The script reports the observed human win rate for `mild` and `spicy`
+difficulty separately. Do not publish a percentage without the sample size.

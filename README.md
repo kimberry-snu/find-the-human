@@ -7,20 +7,25 @@
 1. 방장이 방을 만들고 4자리 초대 코드를 공유합니다.
 2. 일반 게임과 관전 모드는 모두 인간 1명부터 시작할 수 있습니다. 일반 게임에서 혼자 입장하면 선택한 AI들과 바로 플레이합니다.
 3. 시작하면 인간과 AI 모두에게 `형용사+동물` 형식의 익명 이름이 배정됩니다. 실제 닉네임과 AI 여부는 공개 전까지 숨겨집니다.
-4. 각 라운드는 `CHAT → VOTE → REVEAL` 순서로 진행됩니다.
+4. 각 라운드는 `CHAT → VOTE → DEFENSE → REVEAL` 순서로 진행됩니다.
    - **CHAT (90초)**: 공개된 질문 카드를 소재로 자유롭게 대화합니다.
+   - **심문권 (게임당 1회)**: 생존 인간 한 명이 다른 생존자를 지목해 15초 안에 고정 질문에 답하도록 압박합니다.
    - **VOTE (30초)**: 생존자는 자신을 제외한 한 명을 “가장 인간 같다”고 지목합니다. 시간 안에 고르지 않으면 기권입니다.
+   - **DEFENSE (15초)**: 최다 득표자가 공개되고, 단 한 문장의 최후 변론으로 모두를 설득합니다.
    - **REVEAL (약 15초)**: 지목과 이유가 순서대로 나타난 뒤 최다 득표자가 추방됩니다. 동점이면 동점자 중 무작위로 정합니다.
 5. 인간이 모두 추방되면 AI가 즉시 승리합니다. 설정한 마지막 라운드까지 인간이 한 명 이상 생존하면 인간이 승리합니다.
 6. 추방자는 읽기 전용 관전자로 남습니다. 생존 인간 수는 게임 중 공개되지 않습니다.
-7. 관전 모드에서는 AI 6~8명이 서로 대화하고 투표합니다. 승패 없이 마지막에 “전원 AI였습니다”와 전체 정체를 공개합니다.
-8. 종료 화면의 **다시 하기**를 누르면 같은 방의 로비로 돌아갑니다.
+7. 일반 게임의 관전자는 라운드마다 익명 참가자 한 명에게 “인간 예측”을 걸 수 있습니다. 정답과 순위는 게임 종료 때만 공개됩니다.
+8. 관전 모드에서는 AI 6~8명이 서로 대화하고 투표합니다. 승패 없이 마지막에 “전원 AI였습니다”와 전체 정체를 공개합니다.
+9. 종료 화면에는 명탐정·가장 인간 같았던 AI 등의 칭호가 나타나며, 1080×1350 PNG 결과 카드를 저장하거나 공유할 수 있습니다.
+10. 종료 화면의 **다시 하기**를 누르면 같은 방의 로비로 돌아갑니다.
 
 ### 방장 설정
 
 | 설정 | 값 | 동작 |
 | --- | --- | --- |
 | AI 수 | `1~8` 또는 `random` | 직접 지정하거나 시작 순간 서버가 비밀리에 결정 |
+| AI 난이도 | `mild` / `spicy` | 순한맛은 랜덤·단순 추리를 늘리고, 매운맛은 대화 기반 모델 추리를 늘림 |
 | 라운드 수 | 양의 정수, 기본 `3` | 인간이 남아 있을 때 진행할 최대 라운드 |
 | 관전 모드 | ON/OFF | ON이면 접속 인간은 모두 관전자, AI 6~8명만 참가 |
 
@@ -41,7 +46,7 @@
                   │
 Express + Socket.io 서버 (authoritative state machine)
   ├─ rooms: Map<roomCode, Room>
-  ├─ LOBBY → CHAT → VOTE → REVEAL → END
+  ├─ LOBBY → CHAT → VOTE → DEFENSE → REVEAL → END
   ├─ AI 발화/투표 스케줄러
   └─ OpenAI Chat Completions ── 실패/키 없음 ──> mock 응답
 ```
@@ -55,9 +60,11 @@ Express + Socket.io 서버 (authoritative state machine)
 - 기본 발화 확률 25%, 최근 5개 메시지에서 지목되면 80%, 질문 카드에 답하지 않았으면 60%
 - 15초 이상 조용하면 AI 한 명을 강제로 선택
 - AI별 직전 발화 후 8초 cooldown, 라운드당 최소 2회·최대 6회
-- 선택 후 1.5~6초간 `chat:typing`, 여러 AI의 시작은 최소 2초 간격
+- 선택 후 1.5~6초간 익명 `chat:typing`, 여러 AI의 시작은 최소 2초 간격. 입력 중인 참가자의 이름은 AI 정체를 누출하지 않도록 보내지 않음
 - 응답은 최대 30자로 후처리하고 15% 확률로 오타를 넣으며, 두 줄이면 0.7~1.5초 간격으로 나눠 전송
-- 투표는 채팅 생성과 분리된 JSON structured output 호출로 `{ target, reason }`을 받음
+- 순한맛 투표는 약 30% 랜덤·45% 발화량 휴리스틱·25% 모델 추리, 매운맛은 약 15%·25%·60%로 동작
+- 모델 투표는 채팅 생성과 분리된 JSON structured output 호출로 `{ target, reason }`을 받음
+- 심문당한 AI와 최다 득표 AI는 일반 발화 확률을 기다리지 않고 짧은 반말 답변·변론을 강제로 생성
 
 OpenAI 호출에는 기본적으로 temperature `1.1`, max tokens `60`을 사용합니다. 단, 기본 temperature만 허용하는 GPT-5.6 계열은 `1`을 사용합니다. 키가 없거나 호출·검증이 실패하면 아래의 mock 경로로 즉시 이어집니다.
 
@@ -98,6 +105,7 @@ npm start
 | `npm start` | 빌드된 server를 단일 프로세스로 실행 |
 | `npm test` | 타입 검사 후 mock Socket.IO 전체 E2E 실행 |
 | `npm run test:e2e` | 임시 포트에서 서버를 띄워 6개 실시간 시나리오 실행 |
+| `npm run metrics:playtest -- server.log` | 종료 로그에서 난이도별 인간 승률과 표본 수 집계 |
 | `npm run typecheck` | 두 workspace의 TypeScript 검사 실행 |
 
 ## 환경 변수
@@ -137,7 +145,14 @@ mock 모드에서도 AI 발화 판단, typing 지연, 메시지 분할, 투표, 
 4. 배포하면 Railway가 `npm install --include=dev && npm run build`를 실행하고 `npm start`로 서버 하나를 시작합니다.
 5. **Generate Domain**으로 공개 도메인을 만든 뒤 `/health`가 성공하는지 확인합니다.
 
-API 키 없이 배포하면 공개 데모용 mock 모드로 그대로 동작합니다. 공개 서버는 IP별 연결·방 생성·참가·채팅 속도를 제한하며, 방은 최대 10명, 서버 전체는 최대 100개 방을 유지합니다. 로비/종료 방은 15분 무활동 시, 모든 방은 최대 2시간 후 정리됩니다. 방과 플레이어 정보는 메모리에만 있으므로 Railway replica는 반드시 1개로 유지해야 합니다. 재배포나 프로세스 재시작 시 진행 중인 방은 복구되지 않습니다.
+API 키 없이 배포하면 공개 데모용 mock 모드로 그대로 동작합니다. 공개 서버는 IP별 연결·방 생성·참가 속도를 제한하고 채팅 제한은 참가자별로 분리합니다. 방은 최대 10명, 서버 전체는 최대 100개 방을 유지합니다. 로비/종료 방은 15분 무활동 시, 모든 방은 최대 2시간 후 정리됩니다. 방과 플레이어 정보는 메모리에만 있으므로 호스팅 인스턴스는 반드시 1개로 유지해야 합니다. 재배포나 프로세스 재시작 시 진행 중인 방은 복구되지 않습니다.
+
+## 현재 공개 데모
+
+- 전체 앱: [find-the-human-kimberry.onrender.com](https://find-the-human-kimberry.onrender.com/)
+- GitHub Pages 클라이언트: [kimberry-snu.github.io/find-the-human](https://kimberry-snu.github.io/find-the-human/)
+
+Render 무료 Web Service는 일정 시간 요청이 없으면 휴면하므로 첫 접속이 늦을 수 있습니다. 두 주소는 같은 Socket.io 서버를 사용하며, 공개 서버는 비용 사고를 막기 위해 기본적으로 OpenAI 키 없는 Mock AI 모드로 운영합니다.
 
 ## GitHub Pages 배포
 
@@ -160,22 +175,27 @@ GitHub Pages에는 `client/dist` 정적 프런트만 배포됩니다. Socket.IO 
 | `room:create` | `{ nickname }` → ack `{ code, playerId }` | 새 방 생성 및 방장 입장 |
 | `room:join` | `{ code, nickname }` → ack `{ code, playerId }` | 초대 코드로 입장 |
 | `room:rejoin` | `{ playerId, code }` → ack `{ code, playerId }` | 새로고침·일시 단절 뒤 기존 플레이어 복구 |
-| `room:start` | `{ aiCount: number \| 'random', rounds, spectatorMode }` | 방장 설정으로 게임 시작 |
+| `room:start` | `{ aiCount: number \| 'random', rounds, spectatorMode, difficulty }` | 방장 설정으로 게임 시작 |
 | `chat:send` | `{ text }` | CHAT 단계 메시지 전송, 최대 140자 |
 | `vote:cast` | `{ targetAnonName }` | VOTE 단계에서 생존한 다른 참가자 지목 |
+| `interrogation:use` | `{ targetAnonName }` | CHAT에서 게임당 한 번 다른 생존자 심문 |
+| `spectator:bet` | `{ targetAnonName }` | 일반 게임 관전자가 라운드당 한 번 인간 예측 |
 | `room:again` | 없음 | 종료된 같은 방을 로비 상태로 초기화 |
 
 ### server → client
 
 | 이벤트 | payload | 용도 |
 | --- | --- | --- |
-| `room:state` | `{ players[], settings, hostId }` | 로비 참가자·방장·설정 동기화 |
+| `room:state` | `{ players[], settings, hostId, defenseMessageSent? }` | 로비 참가자·방장·설정 및 변론 제출 상태 동기화 |
 | `game:start` | `{ yourAnonName, isSpectator, participants: string[] }` | 개인 익명 이름과 섞인 참가자 목록 전달 |
-| `phase:change` | `{ phase, endsAt, round, questionCard? }` | CHAT/VOTE/REVEAL/END 전환과 서버 마감 시각 전달 |
+| `phase:change` | `{ phase, endsAt, round, questionCard?, defenseTarget? }` | CHAT/VOTE/DEFENSE/REVEAL/END 전환과 서버 마감 시각 전달 |
 | `chat:new` | `{ from, text, ts }` | 인간 또는 AI의 새 채팅 메시지 |
-| `chat:typing` | `{ from, isTyping }` | AI typing 말풍선 표시/해제 |
+| `chat:typing` | `{ isTyping }` | 정체를 드러내지 않는 익명 typing 표시/해제 |
+| `interrogation:start` | `{ target, question, endsAt }` | 사용자를 숨긴 시스템 긴급 심문과 서버 마감 시각 |
+| `interrogation:end` | `{ target, question, answered, endedAt }` | 답변 또는 시간 만료로 심문 종료 |
 | `vote:reveal` | `{ items: [{ voter, target, reason }], eliminated: { anonName, wasAI, revealName } }` | 순차 지목 연출과 추방자 공개 |
-| `game:over` | `{ winner, reveal: [{ anonName, isAI, realNickname?, personaSummary? }] }` | 승자와 전체 정체 공개 |
+| `game:over` | `{ winner, reveal, awards, betLeaderboard }` | 승자·전체 정체·칭호·관전자 순위 공개 |
+| `room:closed` | `{ code, reason }` | TTL 만료 방의 세션을 지우고 시작 화면으로 복귀 |
 | `error` | `{ message }` | 유효성·권한·방 상태 오류 |
 
 브라우저는 받은 `{ playerId, roomCode }`를 `localStorage`에 저장하고 다음 접속에서 `room:rejoin`을 먼저 시도합니다. 복구할 방이나 플레이어가 없으면 저장값을 지우고 홈으로 돌아갑니다.
@@ -189,6 +209,10 @@ GitHub Pages에는 `client/dist` 정적 프런트만 배포됩니다. Socket.IO 
 - AI 수 `random`은 시작 순간 인간 수를 기준으로 `인간 수-1 ~ 인간 수+2` 범위에서 고르되 최소 2·최대 8로 보정하고, 확정 수나 생존 인간 카운터를 별도 payload/UI로 노출하지 않습니다. 다만 스펙상 전체 익명 참가자 목록도 제공하므로 로비 인원을 기억한 사용자는 총원으로 초기 AI 수를 추론할 수 있습니다.
 - 참가자 표시 순서와 익명 이름, AI 페르소나는 게임마다 섞으며 같은 게임 안에서는 중복 배정하지 않습니다.
 - 전원 기권이면 아무도 추방하지 않고 다음 라운드로 진행합니다. 최다 득표 동률은 서버가 동률 후보 중 무작위로 결정합니다.
+- 최다 득표자는 VOTE 종료 순간 한 번만 확정합니다. DEFENSE 중에는 투표를 바꿀 수 없고, 변론이 끝나도 같은 대상이 REVEAL에서 공개됩니다.
+- 심문권은 방 전체에서 게임당 한 번이며 먼저 사용한 생존 인간에게 적용됩니다. 누가 사용했는지는 공개 payload에서 숨겨 인간 정체 단서가 되지 않게 하고, AI는 즉시 강제 답변하며 인간은 평소 채팅 입력으로 답합니다.
+- 관전자 베팅의 정답 여부와 점수는 END 전까지 다른 사용자에게 보내지 않습니다. AI-only 관전 모드에서는 인간 예측 베팅을 막습니다.
+- `room:rejoin`의 비밀 토큰은 본인에게만 보내며, 다른 참가자의 목록에는 재접속에 사용할 수 없는 공개 ID만 제공합니다.
 - 게임 중 새로 입장한 사람과 추방된 사람은 읽기 전용 관전자입니다. 관전자는 채팅과 투표를 보지만 제출할 수 없습니다.
 - 연결이 끊긴 인간은 60초 동안 자리를 보존합니다. 그 안에 `room:rejoin`하면 이어서 참여하고, 초과하면 자동 추방·정체 공개 후 기존 `playerId`를 만료시킵니다. 같은 사용자가 다시 들어오려면 일반 `room:join`으로 새 관전자 세션을 받아야 합니다.
 - 공개된 추방 정체는 게임 내 이력으로 누적해 재접속 스냅샷에서도 복원합니다. 여러 자동 추방이 동시에 발생하면 클라이언트가 공개 카드를 큐로 순차 재생합니다.
@@ -210,7 +234,9 @@ npm test
 npm run build
 ```
 
-`npm test`는 빈 OpenAI 키와 임시 포트, 축소된 테스트 타이머를 사용합니다. 일반 1인+AI 3명 및 2인+AI 3명 게임, 3라운드, 재접속, 권한·입력 검증, 자동 추방, 관전 AI-only, 랜덤 AI 모드를 실제 Socket.IO 연결로 확인하고 자식 서버를 자동 정리합니다.
+`npm test`는 빈 OpenAI 키와 임시 포트, 축소된 테스트 타이머를 사용합니다. 일반 1인+AI 3명 및 2인+AI 3명 게임, 심문, 관전자 베팅, 최후 변론, 엔딩 칭호, 3라운드, 재접속, 세션 탈취 방어, 정체 비공개 계약, 권한·입력 검증, 자동 추방, 관전 AI-only, 랜덤 AI 모드를 실제 Socket.IO 연결로 확인하고 자식 서버를 자동 정리합니다.
+
+심사용 60초 진행 순서, 녹화 체크리스트와 승률 표기 원칙은 [데모 런북](docs/DEMO_RUNBOOK.md)에 정리했습니다. 게임 종료 로그는 채팅 원문이나 닉네임 없이 `game_complete` JSON 한 줄을 남기며 `npm run metrics:playtest`로 난이도별 인간 승률을 집계할 수 있습니다.
 
 빌드 후 `npm start`를 실행하고 `http://localhost:3000/health`도 확인합니다.
 

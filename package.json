@@ -13,6 +13,7 @@
     "start": "npm run start --workspace server",
     "test": "npm run typecheck && npm run test:e2e",
     "test:e2e": "node scripts/e2e.mjs",
+    "metrics:playtest": "node scripts/summarize-playtests.mjs",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {

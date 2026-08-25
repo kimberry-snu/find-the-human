@@ -39,6 +39,13 @@ const AUTO_EVICTION_TIMEOUT_MS = Math.max(
   EVENT_TIMEOUT_MS,
   Math.ceil(60_000 * Number(GAME_TIME_SCALE) + 5_000),
 );
+// A complete round now includes the 15-second final-defense window between
+// VOTE and REVEAL. Keep custom time-scale runs from inheriting the old,
+// shorter phase-sequence timeout.
+const ROUND_SEQUENCE_TIMEOUT_MS = Math.max(
+  EVENT_TIMEOUT_MS,
+  Math.ceil(150_000 * Number(GAME_TIME_SCALE) + 5_000),
+);
 const VERBOSE = process.env.E2E_VERBOSE === '1';
 
 const clientRequire = createRequire(CLIENT_PACKAGE);
@@ -299,6 +306,18 @@ function assertPhase(payload, expectedPhase) {
     assert.equal(typeof payload.questionCard, 'string');
     assert(payload.questionCard.trim().length > 0, 'CHAT phase must include a question card');
   }
+  if (expectedPhase === 'DEFENSE') {
+    assert.equal(typeof payload.defenseTarget, 'string');
+    assert(payload.defenseTarget.length > 0, 'DEFENSE phase must identify its target');
+  }
+}
+
+function assertVisibleHost(state, label) {
+  assertObject(state, label);
+  const hosts = state.players.filter((player) => player.isHost === true);
+  assert.equal(hosts.length, 1, `${label} must expose exactly one host`);
+  assert.equal(state.hostId, hosts[0].id, `${label}.hostId must use the viewer-visible host id`);
+  return hosts[0];
 }
 
 function assertVoteReveal(payload, participantSet) {
@@ -332,6 +351,76 @@ function assertGameOver(payload, participants) {
   for (const identity of payload.reveal) {
     assert.equal(typeof identity.isAI, 'boolean');
   }
+
+  assert(Array.isArray(payload.awards), 'game:over.awards must be an array');
+  const allowedAwardIds = new Set(['humanlike_ai', 'most_suspected_human', 'detective']);
+  for (const [index, award] of payload.awards.entries()) {
+    assertObject(award, `game:over.awards[${index}]`);
+    assert(allowedAwardIds.has(award.id), `unknown award id ${brief(award.id)}`);
+    for (const field of ['title', 'recipient', 'detail']) {
+      assert.equal(typeof award[field], 'string', `award ${award.id}.${field} must be a string`);
+      assert(award[field].length > 0, `award ${award.id}.${field} must not be empty`);
+    }
+  }
+  assert.equal(
+    new Set(payload.awards.map((award) => award.id)).size,
+    payload.awards.length,
+    'award ids must be unique',
+  );
+  const awardIds = new Set(payload.awards.map((award) => award.id));
+  assert(awardIds.has('humanlike_ai'), 'game over must award the most human-like AI');
+  if (payload.reveal.some((identity) => !identity.isAI)) {
+    assert(awardIds.has('most_suspected_human'), 'a normal game must award its most suspected human');
+    assert(payload.awards.length >= 2, 'a normal game must expose at least two ending awards');
+  }
+
+  assert(Array.isArray(payload.betLeaderboard), 'game:over.betLeaderboard must be an array');
+  for (const [index, entry] of payload.betLeaderboard.entries()) {
+    assertObject(entry, `game:over.betLeaderboard[${index}]`);
+    assert.equal(typeof entry.nickname, 'string');
+    assert(entry.nickname.length > 0, 'bet leaderboard nickname must not be empty');
+    assert(Number.isInteger(entry.score) && entry.score >= 0, 'bet score must be a non-negative integer');
+    assert(Number.isInteger(entry.total) && entry.total >= 0, 'bet total must be a non-negative integer');
+    assert(entry.score <= entry.total, 'bet score cannot exceed total bets');
+  }
+}
+
+function assertInterrogation(payload, expectedTarget) {
+  assertObject(payload, 'interrogation:start');
+  assert.deepEqual(
+    Object.keys(payload).sort(),
+    ['endsAt', 'question', 'target'],
+    'interrogation:start must not reveal which participant is certainly human',
+  );
+  assert.equal(payload.target, expectedTarget);
+  assert.equal(typeof payload.question, 'string');
+  assert(payload.question.trim().length > 0, 'interrogation question must not be empty');
+  assert(Number.isFinite(payload.endsAt), 'interrogation endsAt must be numeric');
+}
+
+async function exerciseHumanDefense(probe, defenseTarget, expectedAnonName, label) {
+  if (defenseTarget !== expectedAnonName) return;
+
+  const text = `${label}-${Date.now()}`;
+  const messageAfter = probe.mark();
+  await probe.emitAck('chat:send', { text }, `${label} first defense chat:send`);
+  const message = await probe.expect('chat:new', (payload) => payload?.text === text, {
+    after: messageAfter,
+    description: `${label} defense chat echo`,
+  });
+  assert.equal(message.from, expectedAnonName);
+  const defenseState = await probe.expect(
+    'room:state',
+    (payload) => payload?.phase === 'DEFENSE' && payload?.defenseMessageSent === true,
+    { after: messageAfter, description: `${label} defense completion state` },
+  );
+  assert.equal(defenseState.defenseTarget, expectedAnonName);
+  await expectRejectedAck(
+    probe,
+    'chat:send',
+    { text: `${text}-again` },
+    `${label} duplicate defense chat:send`,
+  );
 }
 
 async function createRoom(probe, nickname) {
@@ -339,6 +428,7 @@ async function createRoom(probe, nickname) {
   const ack = await probe.emitAck('room:create', { nickname }, 'room:create');
   assertObject(ack, 'room:create ack');
   assertRoomCode(ack.code);
+  assert.equal(typeof ack.playerId, 'string', 'room:create must return the owner rejoin token');
 
   const state = await probe.expect(
     'room:state',
@@ -347,8 +437,9 @@ async function createRoom(probe, nickname) {
   );
   const player = state.players.find((candidate) => candidate.nickname === nickname);
   assert.equal(typeof player.id, 'string');
+  assert.equal(player.id, ack.playerId, 'a viewer may receive only its own rejoin token');
   assert.equal(state.hostId, player.id, 'room creator must be host');
-  return { code: ack.code, playerId: player.id, state };
+  return { code: ack.code, playerId: ack.playerId, state };
 }
 
 async function joinRoom(probe, hostProbe, code, nickname) {
@@ -372,7 +463,14 @@ async function joinRoom(probe, hostProbe, code, nickname) {
   assert.equal(hostState.players.length, 2, 'host and guest room state must agree');
   const player = guestState.players.find((candidate) => candidate.nickname === nickname);
   assert.equal(typeof player.id, 'string');
-  return { playerId: player.id, state: guestState };
+  const publicPlayer = hostState.players.find((candidate) => candidate.nickname === nickname);
+  assert.equal(typeof publicPlayer?.id, 'string');
+  assert.notEqual(publicPlayer.id, player.id, 'another viewer must receive only the public player id');
+  assert(
+    !JSON.stringify(hostState).includes(player.id),
+    'the host snapshot must not contain the guest rejoin token',
+  );
+  return { playerId: player.id, publicId: publicPlayer.id, state: guestState, hostState };
 }
 
 async function startGame(host, peers, settings) {
@@ -402,7 +500,9 @@ async function startGame(host, peers, settings) {
 }
 
 async function runNormalFlow(baseUrl, allProbes) {
-  console.log('\n[1/6] Normal room: create/join/start/chat/rejoin/vote/reveal/end/again');
+  console.log(
+    '\n[1/6] Normal room: interrogation/betting/rejoin/vote/defense/reveal/end/again',
+  );
   const host = new Probe('normal-host', baseUrl);
   const guest = new Probe('normal-guest', baseUrl);
   allProbes.push(host, guest);
@@ -412,11 +512,29 @@ async function runNormalFlow(baseUrl, allProbes) {
   const created = await createRoom(host, 'host-e2e');
   const joined = await joinRoom(guest, host, created.code, 'guest-e2e');
 
+  step('reject room:rejoin with a public player id and keep the victim connected');
+  assert(
+    !JSON.stringify(joined.state).includes(created.playerId),
+    'the guest snapshot must not contain the host rejoin token',
+  );
+  const hijacker = new Probe('public-id-hijack', baseUrl);
+  allProbes.push(hijacker);
+  await hijacker.connect();
+  await expectRejectedAck(
+    hijacker,
+    'room:rejoin',
+    { playerId: joined.publicId, code: created.code },
+    'public id room:rejoin hijack',
+  );
+  assert.equal(guest.socket.connected, true, 'failed public-id hijack must not disconnect the victim');
+  hijacker.close();
+
   step('start one round with exactly three AI participants');
   const normal = await startGame(host, [guest], {
     aiCount: 3,
     rounds: 1,
     spectatorMode: false,
+    difficulty: 'mild',
   });
   const hostStart = normal.starts[0];
   const guestStart = normal.starts[1];
@@ -432,7 +550,7 @@ async function runNormalFlow(baseUrl, allProbes) {
   assert(hostStart.participants.includes(guestStart.yourAnonName));
 
   step('join during CHAT and verify the complete spectator snapshot');
-  const chatJoin = new Probe('normal-chat-join', baseUrl);
+  let chatJoin = new Probe('normal-chat-join', baseUrl);
   allProbes.push(chatJoin);
   await chatJoin.connect();
   const chatJoinAfter = chatJoin.mark();
@@ -473,6 +591,15 @@ async function runNormalFlow(baseUrl, allProbes) {
   assert.equal(chatJoinState.isSpectator, true);
   assert.deepEqual(chatJoinState.participants, hostStart.participants);
   assert.equal(chatJoinState.result, undefined);
+  const observerSnapshot = JSON.stringify(chatJoinState);
+  assert(
+    !observerSnapshot.includes(created.playerId),
+    'an observer snapshot must not contain the host rejoin token through players or hostId',
+  );
+  assert(
+    !observerSnapshot.includes(joined.playerId),
+    'an observer snapshot must not contain another participant rejoin token',
+  );
   const chatJoinPlayer = chatJoinState.players.find(
     (player) => player.id === chatJoinAck.playerId,
   );
@@ -483,6 +610,151 @@ async function runNormalFlow(baseUrl, allProbes) {
   assert.equal(chatJoinPlayer.alive, false);
   assertPhase(chatJoinPhase, 'CHAT');
   assert.equal(chatJoinPhase.questionCard, normal.chatPhases[0].questionCard);
+
+  step('place a late-spectator human prediction without leaking intermediate scores');
+  const spectatorBetAfter = chatJoin.mark();
+  const hostBetStateAfter = host.mark();
+  const spectatorBetAckPromise = chatJoin.emitAck(
+    'spectator:bet',
+    { targetAnonName: hostStart.yourAnonName },
+    'CHAT spectator:bet',
+  );
+  const [spectatorBetAck, spectatorBetState, hostBetState] = await Promise.all([
+    spectatorBetAckPromise,
+    chatJoin.expect(
+      'room:state',
+      (payload) =>
+        payload?.spectatorBet?.round === 1 &&
+        payload?.spectatorBet?.targetAnonName === hostStart.yourAnonName,
+      { after: spectatorBetAfter, description: 'spectator bet restored in room snapshot' },
+    ),
+    host.expect('room:state', (payload) => payload?.phase === 'CHAT', {
+      after: hostBetStateAfter,
+      description: 'host snapshot after spectator bet',
+    }),
+  ]);
+  assert.deepEqual(spectatorBetAck.spectatorBet, {
+    round: 1,
+    targetAnonName: hostStart.yourAnonName,
+  });
+  for (const [label, state] of [
+    ['spectator', spectatorBetState],
+    ['participant', hostBetState],
+  ]) {
+    assert.equal(state.betLeaderboard, undefined, `${label} must not see a mid-game leaderboard`);
+    for (const player of state.players) {
+      assert.equal(player.spectatorScore, undefined, `${label} must not see spectatorScore`);
+      assert.equal(player.score, undefined, `${label} must not see another player's bet score`);
+      assert.equal(player.total, undefined, `${label} must not see another player's bet total`);
+    }
+  }
+
+  step('rejoin the late spectator and restore only its own saved bet');
+  const previousChatJoin = chatJoin;
+  previousChatJoin.disconnect();
+  chatJoin = new Probe('normal-chat-join-rejoined', baseUrl);
+  allProbes.push(chatJoin);
+  await chatJoin.connect();
+  const betRejoinAfter = chatJoin.mark();
+  const betRejoinAckPromise = chatJoin.emitAck(
+    'room:rejoin',
+    { playerId: chatJoinAck.playerId, code: created.code },
+    'spectator bet room:rejoin',
+  );
+  const [betRejoinAck, betRejoinState, betRejoinStart] = await Promise.all([
+    betRejoinAckPromise,
+    chatJoin.expect(
+      'room:state',
+      (payload) =>
+        payload?.isSpectator === true &&
+        payload?.spectatorBet?.round === 1 &&
+        payload?.spectatorBet?.targetAnonName === hostStart.yourAnonName,
+      { after: betRejoinAfter, description: 'saved spectator bet after room:rejoin' },
+    ),
+    chatJoin.expect('game:start', (payload) => payload?.isSpectator === true, {
+      after: betRejoinAfter,
+      description: 'rejoined betting spectator identity',
+    }),
+  ]);
+  assert.equal(betRejoinAck.playerId, chatJoinAck.playerId);
+  assert.equal(betRejoinStart.yourAnonName, '');
+  assert.deepEqual(betRejoinState.spectatorBet, spectatorBetAck.spectatorBet);
+  previousChatJoin.close();
+
+  step('use the one-shot interrogation and end it when the human target answers');
+  const hostInterrogationAfter = host.mark();
+  const guestInterrogationAfter = guest.mark();
+  const interrogationAckPromise = host.emitAck(
+    'interrogation:use',
+    { targetAnonName: guestStart.yourAnonName },
+    'interrogation:use',
+  );
+  const [interrogationAck, hostInterrogation, guestInterrogation, interrogationState] =
+    await Promise.all([
+      interrogationAckPromise,
+      host.expect('interrogation:start', null, {
+        after: hostInterrogationAfter,
+        description: 'host interrogation:start',
+      }),
+      guest.expect('interrogation:start', null, {
+        after: guestInterrogationAfter,
+        description: 'guest interrogation:start',
+      }),
+      host.expect(
+        'room:state',
+        (payload) =>
+          payload?.interrogationUsed === true &&
+          payload?.interrogation?.target === guestStart.yourAnonName,
+        { after: hostInterrogationAfter, description: 'interrogation room state' },
+      ),
+    ]);
+  assert.equal(interrogationAck.ok, true);
+  assertInterrogation(hostInterrogation, guestStart.yourAnonName);
+  assertInterrogation(guestInterrogation, guestStart.yourAnonName);
+  assert.deepEqual(guestInterrogation, hostInterrogation);
+  assert.equal(interrogationState.interrogationUsed, true);
+  assertInterrogation(interrogationState.interrogation, guestStart.yourAnonName);
+
+  const interrogationAnswer = `interrogation-e2e-${Date.now()}`;
+  const hostAnswerAfter = host.mark();
+  const guestAnswerAfter = guest.mark();
+  const answerAckPromise = guest.emitAck(
+    'chat:send',
+    { text: interrogationAnswer },
+    'interrogation answer chat:send',
+  );
+  const [answerAck, answerChat, hostInterrogationEnd, guestInterrogationEnd] =
+    await Promise.all([
+      answerAckPromise,
+      host.expect('chat:new', (payload) => payload?.text === interrogationAnswer, {
+        after: hostAnswerAfter,
+        description: 'interrogation answer broadcast',
+      }),
+      host.expect('interrogation:end', null, {
+        after: hostAnswerAfter,
+        description: 'host interrogation:end',
+      }),
+      guest.expect('interrogation:end', null, {
+        after: guestAnswerAfter,
+        description: 'guest interrogation:end',
+      }),
+    ]);
+  assert.equal(answerAck.ok, true);
+  assert.equal(answerChat.from, guestStart.yourAnonName);
+  assert.equal(hostInterrogationEnd.answered, true);
+  assert.deepEqual(
+    Object.keys(hostInterrogationEnd).sort(),
+    ['answered', 'endedAt', 'question', 'target'],
+    'interrogation:end must not reveal the interrogator',
+  );
+  assert.deepEqual(guestInterrogationEnd, hostInterrogationEnd);
+  await expectRejectedAck(
+    host,
+    'interrogation:use',
+    { targetAnonName: guestStart.yourAnonName },
+    'duplicate interrogation:use',
+  );
+  const normalVoteAfter = host.mark();
 
   step('send a human chat message and verify both clients receive it');
   const chatText = `e2e-${Date.now()}`;
@@ -526,15 +798,16 @@ async function runNormalFlow(baseUrl, allProbes) {
     }),
     rejoined.expect(
       'phase:change',
-      (payload) => ['CHAT', 'VOTE'].includes(payload?.phase),
+      (payload) => ['CHAT', 'VOTE', 'DEFENSE'].includes(payload?.phase),
       { after: rejoinAfter, description: 'current phase restored after room:rejoin' },
     ),
   ]);
   assert.equal(rejoinStart.yourAnonName, guestStart.yourAnonName);
   assert.equal(rejoinStart.isSpectator, false);
   assert.deepEqual(rejoinStart.participants, hostStart.participants);
-  assert.equal(rejoinState.hostId, created.playerId);
-  assert(['CHAT', 'VOTE'].includes(rejoinPhase.phase));
+  assert.notEqual(rejoinState.hostId, created.playerId, 'a guest must not receive the host rejoin token');
+  assertVisibleHost(rejoinState, 'rejoined guest state');
+  assert(['CHAT', 'VOTE', 'DEFENSE'].includes(rejoinPhase.phase));
 
   const voteRejoin = new Probe('normal-guest-vote-rejoined', baseUrl);
   allProbes.push(voteRejoin);
@@ -542,7 +815,7 @@ async function runNormalFlow(baseUrl, allProbes) {
 
   step('cast a vote, rejoin during VOTE, and restore hasVoted=true');
   const votePhase = await host.expect('phase:change', (payload) => payload?.phase === 'VOTE', {
-    after: normal.marks.get(host),
+    after: normalVoteAfter,
     description: 'VOTE phase',
   });
   assertPhase(votePhase, 'VOTE');
@@ -601,6 +874,37 @@ async function runNormalFlow(baseUrl, allProbes) {
     'duplicate vote:cast',
   );
 
+  step('enter final defense before revealing the most-voted participant');
+  const defenseAfterHost = host.mark();
+  const defenseAfterGuest = voteRejoin.mark();
+  const [hostDefensePhase, guestDefensePhase] = await Promise.all([
+    host.expect('phase:change', (payload) => payload?.phase === 'DEFENSE', {
+      after: defenseAfterHost,
+      description: 'normal DEFENSE phase',
+      timeoutMs: ROUND_SEQUENCE_TIMEOUT_MS,
+    }),
+    voteRejoin.expect('phase:change', (payload) => payload?.phase === 'DEFENSE', {
+      after: defenseAfterGuest,
+      description: 'guest normal DEFENSE phase',
+      timeoutMs: ROUND_SEQUENCE_TIMEOUT_MS,
+    }),
+  ]);
+  assertPhase(hostDefensePhase, 'DEFENSE');
+  assert.deepEqual(guestDefensePhase, hostDefensePhase);
+  assert(new Set(hostStart.participants).has(hostDefensePhase.defenseTarget));
+  await exerciseHumanDefense(
+    host,
+    hostDefensePhase.defenseTarget,
+    hostStart.yourAnonName,
+    'normal host',
+  );
+  await exerciseHumanDefense(
+    voteRejoin,
+    hostDefensePhase.defenseTarget,
+    guestStart.yourAnonName,
+    'normal guest',
+  );
+
   const revealAfterHost = host.mark();
   const revealAfterGuest = voteRejoin.mark();
 
@@ -608,6 +912,7 @@ async function runNormalFlow(baseUrl, allProbes) {
     host.expect('phase:change', (payload) => payload?.phase === 'REVEAL', {
       after: revealAfterHost,
       description: 'REVEAL phase',
+      timeoutMs: ROUND_SEQUENCE_TIMEOUT_MS,
     }),
     host.expect('vote:reveal', null, {
       after: revealAfterHost,
@@ -677,6 +982,12 @@ async function runNormalFlow(baseUrl, allProbes) {
     new Set(['host-e2e', 'guest-e2e']),
     'human nicknames must be revealed at game over',
   );
+  const spectatorResult = gameOver.betLeaderboard.find(
+    (entry) => entry.nickname === 'chat-join-e2e',
+  );
+  assertObject(spectatorResult, 'late spectator leaderboard entry');
+  assert.equal(spectatorResult.total, 1, 'the spectator must have one resolved prediction');
+  assert.equal(spectatorResult.score, 1, 'betting on a known human must score one point');
 
   step('join during END and verify result plus game:over are restored');
   const endJoin = new Probe('normal-end-join', baseUrl);
@@ -754,7 +1065,9 @@ async function runNormalFlow(baseUrl, allProbes) {
     ),
   ]);
   assert.equal(hostLobby.hostId, created.playerId);
-  assert.equal(guestLobby.hostId, created.playerId);
+  assertVisibleHost(hostLobby, 'host room:again lobby');
+  assert.notEqual(guestLobby.hostId, created.playerId, 'guest lobby must hide the host rejoin token');
+  assertVisibleHost(guestLobby, 'guest room:again lobby');
   assert(hostLobby.players.every((player) => player.connected));
   assert.deepEqual(
     new Set(hostLobby.players.map((player) => player.nickname)),
@@ -776,6 +1089,7 @@ async function runSoloFlow(baseUrl, allProbes) {
     aiCount: 3,
     rounds: 1,
     spectatorMode: false,
+    difficulty: 'mild',
   });
   const [gameStart] = started.starts;
   assertObject(gameStart, 'solo game:start');
@@ -808,11 +1122,31 @@ async function runSoloFlow(baseUrl, allProbes) {
     'solo vote:cast',
   );
 
+  const defenseAfter = solo.mark();
+  const defensePhase = await solo.expect(
+    'phase:change',
+    (payload) => payload?.phase === 'DEFENSE',
+    {
+      after: defenseAfter,
+      description: 'solo DEFENSE phase',
+      timeoutMs: ROUND_SEQUENCE_TIMEOUT_MS,
+    },
+  );
+  assertPhase(defensePhase, 'DEFENSE');
+  assert(new Set(gameStart.participants).has(defensePhase.defenseTarget));
+  await exerciseHumanDefense(
+    solo,
+    defensePhase.defenseTarget,
+    gameStart.yourAnonName,
+    'solo human',
+  );
+
   const revealAfter = solo.mark();
   const [revealPhase, reveal] = await Promise.all([
     solo.expect('phase:change', (payload) => payload?.phase === 'REVEAL', {
       after: revealAfter,
       description: 'solo REVEAL phase',
+      timeoutMs: ROUND_SEQUENCE_TIMEOUT_MS,
     }),
     solo.expect('vote:reveal', null, {
       after: revealAfter,
@@ -906,7 +1240,7 @@ async function playThreeRoundAttempt({
     assert(commonAiTarget, `round ${round} needs a living AI vote target`);
 
     const connectedProbes = [...new Set(humans.map((human) => human.probe))];
-    const revealMarks = new Map(connectedProbes.map((probe) => [probe, probe.mark()]));
+    const defenseMarks = new Map(connectedProbes.map((probe) => [probe, probe.mark()]));
     await Promise.all(
       humans
         .filter((human) => human.alive)
@@ -919,6 +1253,39 @@ async function playThreeRoundAttempt({
         ),
     );
 
+    const receivedDefensePhases = await Promise.all(
+      connectedProbes.map((probe) =>
+        probe.expect(
+          'phase:change',
+          (payload) => payload?.phase === 'DEFENSE' && payload?.round === round,
+          {
+            after: defenseMarks.get(probe),
+            description: `round ${round} DEFENSE phase`,
+            timeoutMs: ROUND_SEQUENCE_TIMEOUT_MS,
+          },
+        ),
+      ),
+    );
+    const defensePhase = receivedDefensePhases[connectedProbes.indexOf(roomHost)];
+    assertPhase(defensePhase, 'DEFENSE');
+    assert(aliveBefore.has(defensePhase.defenseTarget));
+    for (const receivedDefense of receivedDefensePhases) {
+      assert.deepEqual(receivedDefense, defensePhase, `all clients must agree on round ${round} defense`);
+    }
+    const defendingHuman = humans.find(
+      (human) => human.alive && human.anonName === defensePhase.defenseTarget,
+    );
+    if (defendingHuman) {
+      await exerciseHumanDefense(
+        defendingHuman.probe,
+        defensePhase.defenseTarget,
+        defendingHuman.anonName,
+        `round ${round} human`,
+      );
+    }
+
+    const revealMarks = new Map(connectedProbes.map((probe) => [probe, probe.mark()]));
+
     const [revealPhase, ...receivedReveals] = await Promise.all([
       roomHost.expect(
         'phase:change',
@@ -926,6 +1293,7 @@ async function playThreeRoundAttempt({
         {
           after: revealMarks.get(roomHost),
           description: `round ${round} REVEAL phase`,
+          timeoutMs: ROUND_SEQUENCE_TIMEOUT_MS,
         },
       ),
       ...connectedProbes.map((probe) =>
@@ -1021,12 +1389,13 @@ async function playThreeRoundAttempt({
         }),
         rejoinedPeer.expect(
           'phase:change',
-          (payload) => ['REVEAL', 'CHAT', 'VOTE'].includes(payload?.phase),
+          (payload) => ['REVEAL', 'CHAT', 'VOTE', 'DEFENSE'].includes(payload?.phase),
           { after: rejoinAfter, description: 'three-round phase restored on rejoin' },
         ),
       ]);
       assert.equal(rejoinAck.playerId, peerPlayerId);
-      assert.equal(rejoinState.hostId, roomHostPlayerId);
+      assert.notEqual(rejoinState.hostId, roomHostPlayerId, 'peer snapshot must hide the host rejoin token');
+      assertVisibleHost(rejoinState, 'three-round peer rejoin state');
       assert.deepEqual(new Set(rejoinState.eliminatedNames), eliminatedNames);
       assert.deepEqual(
         new Set(rejoinState.eliminationHistory.map((item) => item.anonName)),
@@ -1098,7 +1467,7 @@ async function runThreeRoundChecklistFlow(baseUrl, allProbes) {
   await expectRejectedAck(
     roomHost,
     'room:start',
-    { aiCount: 3, rounds: 3, spectatorMode: false },
+    { aiCount: 3, rounds: 3, spectatorMode: false, difficulty: 'mild' },
     'non-host room:start',
   );
   assert.equal(
@@ -1117,7 +1486,7 @@ async function runThreeRoundChecklistFlow(baseUrl, allProbes) {
     (payload) =>
       payload?.hostId === joined.playerId &&
       payload?.players?.some(
-        (player) => player.id === created.playerId && player.connected === false,
+        (player) => player.isYou !== true && player.connected === false,
       ),
     { after: delegationAfter, description: 'host delegation after disconnect' },
   );
@@ -1140,10 +1509,8 @@ async function runThreeRoundChecklistFlow(baseUrl, allProbes) {
     returnedHost.expect(
       'room:state',
       (payload) =>
-        payload?.hostId === joined.playerId &&
-        payload?.players?.some(
-          (player) => player.id === created.playerId && player.connected === true,
-        ),
+        payload?.players?.some((player) => player.isYou === true && player.connected === true) &&
+        payload?.players?.some((player) => player.isHost === true && player.id === payload.hostId),
       { after: returnAfter, description: 'original host rejoined as a peer' },
     ),
   ]);
@@ -1159,6 +1526,7 @@ async function runThreeRoundChecklistFlow(baseUrl, allProbes) {
       aiCount: 3,
       rounds: 3,
       spectatorMode: false,
+      difficulty: 'mild',
     });
 
     if (attempt === 1) {
@@ -1219,7 +1587,9 @@ async function runThreeRoundChecklistFlow(baseUrl, allProbes) {
       }),
     ]);
     assert.equal(hostLobby.hostId, joined.playerId);
-    assert.equal(peerLobby.hostId, joined.playerId);
+    assertVisibleHost(hostLobby, 'three-round host retry lobby');
+    assert.notEqual(peerLobby.hostId, joined.playerId, 'peer lobby must hide the host rejoin token');
+    assertVisibleHost(peerLobby, 'three-round peer retry lobby');
     assert(hostLobby.players.every((player) => player.connected));
   }
 
@@ -1253,6 +1623,7 @@ async function runAutomaticEvictionFlow(baseUrl, allProbes) {
     aiCount: 3,
     rounds: 3,
     spectatorMode: false,
+    difficulty: 'mild',
   });
   const [hostStart] = started.starts;
 
@@ -1264,7 +1635,7 @@ async function runAutomaticEvictionFlow(baseUrl, allProbes) {
     (payload) =>
       payload?.hostId === joined.playerId &&
       payload?.players?.some(
-        (player) => player.id === created.playerId && player.connected === false,
+        (player) => player.isYou !== true && player.connected === false,
       ),
     { after: disconnectAfter, description: 'in-game host delegation' },
   );
@@ -1343,6 +1714,7 @@ async function runSpectatorFlow(baseUrl, allProbes) {
     aiCount: 6,
     rounds: 1,
     spectatorMode: true,
+    difficulty: 'mild',
   });
   const gameStart = started.starts[0];
   assert.equal(gameStart.isSpectator, true);
@@ -1358,22 +1730,55 @@ async function runSpectatorFlow(baseUrl, allProbes) {
     );
   }
 
-  step('let the AI-only round vote, reveal, and finish without human input');
-  const afterStart = started.marks.get(spectator);
+  step('reject spectator betting in the all-AI spectator mode');
+  await expectRejectedAck(
+    spectator,
+    'spectator:bet',
+    { targetAnonName: gameStart.participants[0] },
+    'AI-only spectator:bet',
+  );
+  const spectatorSequenceAfter = spectator.mark();
+
+  step('let the AI-only round vote, defend, reveal, and finish without human input');
   const votePhase = await spectator.expect(
     'phase:change',
     (payload) => payload?.phase === 'VOTE',
-    { after: afterStart, description: 'spectator VOTE phase' },
+    { after: spectatorSequenceAfter, description: 'spectator VOTE phase' },
   );
   assertPhase(votePhase, 'VOTE');
+  const defensePhase = await spectator.expect(
+    'phase:change',
+    (payload) => payload?.phase === 'DEFENSE',
+    {
+      after: spectatorSequenceAfter,
+      description: 'spectator DEFENSE phase',
+      timeoutMs: ROUND_SEQUENCE_TIMEOUT_MS,
+    },
+  );
+  assertPhase(defensePhase, 'DEFENSE');
+  assert(new Set(gameStart.participants).has(defensePhase.defenseTarget));
+  const genericTyping = await spectator.expect(
+    'chat:typing',
+    (payload) => payload?.isTyping === true,
+    { after: spectatorSequenceAfter, description: 'anonymous AI typing signal' },
+  );
+  assert.deepEqual(
+    Object.keys(genericTyping).sort(),
+    ['isTyping'],
+    'chat:typing must not reveal which participant is an AI',
+  );
   const revealPhase = await spectator.expect(
     'phase:change',
     (payload) => payload?.phase === 'REVEAL',
-    { after: afterStart, description: 'spectator REVEAL phase' },
+    {
+      after: spectatorSequenceAfter,
+      description: 'spectator REVEAL phase',
+      timeoutMs: ROUND_SEQUENCE_TIMEOUT_MS,
+    },
   );
   assertPhase(revealPhase, 'REVEAL');
   const voteReveal = await spectator.expect('vote:reveal', null, {
-    after: afterStart,
+    after: spectatorSequenceAfter,
     description: 'spectator vote:reveal',
   });
   assertVoteReveal(voteReveal, new Set(gameStart.participants));
@@ -1385,11 +1790,11 @@ async function runSpectatorFlow(baseUrl, allProbes) {
 
   const [endPhase, gameOver] = await Promise.all([
     spectator.expect('phase:change', (payload) => payload?.phase === 'END', {
-      after: afterStart,
+      after: spectatorSequenceAfter,
       description: 'spectator END phase',
     }),
     spectator.expect('game:over', null, {
-      after: afterStart,
+      after: spectatorSequenceAfter,
       description: 'spectator game:over',
     }),
   ]);
@@ -1410,6 +1815,7 @@ async function runRandomFlow(normalRoom) {
     aiCount: 'random',
     rounds: 1,
     spectatorMode: false,
+    difficulty: 'spicy',
   });
   const [hostStart, guestStart] = started.starts;
   assert.equal(hostStart.isSpectator, false);
@@ -1421,6 +1827,60 @@ async function runRandomFlow(normalRoom) {
     inferredAiCount >= 2 && inferredAiCount <= 4,
     `two humans with random AI count must produce 2-4 AIs, inferred ${inferredAiCount}`,
   );
+}
+
+async function runChatRateLimitIsolation(entry) {
+  console.log('\n[guardrail] Shared-IP chat limits are isolated per participant');
+  const port = await reservePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const child = spawn(process.execPath, [entry], {
+    cwd: SERVER_DIR,
+    env: {
+      ...process.env,
+      PORT: String(port),
+      OPENAI_API_KEY: '',
+      GAME_TIME_SCALE,
+      RATE_LIMIT_DISABLED: '0',
+      NODE_ENV: 'production',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+  const getOutput = captureServerOutput(child);
+  const first = new Probe('rate-limit-first', baseUrl);
+  const second = new Probe('rate-limit-second', baseUrl);
+
+  try {
+    await waitForHealth(baseUrl, child);
+    await Promise.all([first.connect(), second.connect()]);
+    const created = await createRoom(first, 'rate-first-e2e');
+    await joinRoom(second, first, created.code, 'rate-second-e2e');
+    await startGame(first, [second], {
+      aiCount: 1,
+      rounds: 1,
+      spectatorMode: false,
+      difficulty: 'mild',
+    });
+
+    for (let index = 0; index < 5; index += 1) {
+      await Promise.all([
+        first.emitAck('chat:send', { text: `first-${index}` }, `first chat ${index + 1}`),
+        second.emitAck('chat:send', { text: `second-${index}` }, `second chat ${index + 1}`),
+      ]);
+    }
+    await Promise.all([
+      expectRejectedAck(first, 'chat:send', { text: 'first-over-limit' }, 'first sixth chat'),
+      expectRejectedAck(second, 'chat:send', { text: 'second-over-limit' }, 'second sixth chat'),
+    ]);
+    assert.equal(first.socket.connected, true);
+    assert.equal(second.socket.connected, true);
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${getOutput()}`);
+  } finally {
+    first.close();
+    second.close();
+    await stopServer(child);
+  }
 }
 
 async function reservePort() {
@@ -1620,10 +2080,14 @@ async function main() {
     await runAutomaticEvictionFlow(baseUrl, probes);
     await runSpectatorFlow(baseUrl, probes);
     await runRandomFlow(normalRoom);
+    await runChatRateLimitIsolation(entry);
 
     console.log('\nPASS: Socket.IO E2E contract completed successfully.');
     console.log(
       '      solo 1-human + 3-AI completion, normal/rejoin, exact three-round 2-human + 3-AI,',
+    );
+    console.log(
+      '      interrogation, spectator betting, final defense, ending awards, difficulty,',
     );
     console.log(
       '      validation guards, host delegation/automatic eviction, spectator, and random AI verified.',

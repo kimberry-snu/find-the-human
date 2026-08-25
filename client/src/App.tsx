@@ -1,4 +1,5 @@
 import { GameScreen } from './components/GameScreen';
+import { DefenseScreen } from './components/DefenseScreen';
 import { HomeScreen } from './components/HomeScreen';
 import { LobbyScreen } from './components/LobbyScreen';
 import { ResultScreen } from './components/ResultScreen';
@@ -56,6 +57,7 @@ export default function App() {
         roomCode={state.roomCode}
         isHost={isHost}
         onAgain={actions.playAgain}
+        onNotify={actions.notify}
       />
     );
   } else if (state.gameStarted && state.phase === 'REVEAL' && state.reveal) {
@@ -66,6 +68,19 @@ export default function App() {
         totalRounds={state.totalRounds}
         endsAt={state.endsAt}
         yourAnonName={state.yourAnonName}
+      />
+    );
+  } else if (state.gameStarted && state.phase === 'DEFENSE') {
+    screen = (
+      <DefenseScreen
+        defenseTarget={state.defenseTarget}
+        endsAt={state.endsAt}
+        yourAnonName={state.yourAnonName}
+        isSpectator={state.isSpectator}
+        connected={state.connected}
+        messages={state.messages}
+        defenseMessageSent={state.defenseMessageSent}
+        onSend={actions.sendChat}
       />
     );
   } else if (state.gameStarted) {
@@ -85,8 +100,14 @@ export default function App() {
         eliminationHistory={state.eliminationHistory}
         hasVoted={state.hasVoted}
         connected={state.connected}
+        spectatorMode={state.settings.spectatorMode}
+        interrogation={state.interrogation}
+        interrogationUsed={state.interrogationUsed}
+        spectatorBet={state.spectatorBet}
         onSend={actions.sendChat}
         onVote={actions.castVote}
+        onUseInterrogation={actions.useInterrogation}
+        onPlaceSpectatorBet={actions.placeSpectatorBet}
       />
     );
   } else if (state.roomCode) {

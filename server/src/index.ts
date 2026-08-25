@@ -187,12 +187,12 @@ const makeRoomForRateLimitBucket = (now: number): void => {
   if (oldestKey) rateLimitBuckets.delete(oldestKey);
 };
 
-const consumeRateLimit = (ip: string, name: RateLimitName): void => {
+const consumeRateLimit = (identity: string, name: RateLimitName): void => {
   if (rateLimitsDisabled) return;
 
   const now = Date.now();
   const policy = rateLimitPolicies[name];
-  const key = `${name}:${ip}`;
+  const key = `${name}:${identity}`;
   const existing = rateLimitBuckets.get(key);
   const timestamps = (existing?.timestamps ?? []).filter((timestamp) => timestamp > now - policy.windowMs);
 
@@ -249,20 +249,30 @@ io.on("connection", (socket: GameSocket) => {
 
   socket.on(
     "room:start",
-    (payload: { aiCount?: unknown; rounds?: unknown; spectatorMode?: unknown } = {}, ack?: Ack) => {
+    (payload: { aiCount?: unknown; rounds?: unknown; spectatorMode?: unknown; difficulty?: unknown } = {}, ack?: Ack) => {
       perform(socket, ack, () => engine.startGame(socket, payload));
     }
   );
 
   socket.on("chat:send", (payload: { text?: unknown } = {}, ack?: Ack) => {
     perform(socket, ack, () => {
-      consumeRateLimit(ip, "chat:send");
+      // 행사장/학교 Wi-Fi에서는 많은 참가자가 한 공인 IP를 공유한다.
+      // 방 접근 방어는 IP 기준을 유지하되 채팅 속도는 참가자 연결별로 격리한다.
+      consumeRateLimit(socket.data.playerId ?? socket.id, "chat:send");
       engine.sendChat(socket, payload.text);
     });
   });
 
   socket.on("vote:cast", (payload: { targetAnonName?: unknown } = {}, ack?: Ack) => {
     perform(socket, ack, () => engine.castVote(socket, payload.targetAnonName));
+  });
+
+  socket.on("interrogation:use", (payload: { targetAnonName?: unknown } = {}, ack?: Ack) => {
+    perform(socket, ack, () => engine.useInterrogation(socket, payload.targetAnonName));
+  });
+
+  socket.on("spectator:bet", (payload: { targetAnonName?: unknown } = {}, ack?: Ack) => {
+    respond(socket, ack, () => engine.placeSpectatorBet(socket, payload.targetAnonName));
   });
 
   socket.on("room:again", (_payload: unknown = {}, ack?: Ack) => {

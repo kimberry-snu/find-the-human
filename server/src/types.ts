@@ -1,9 +1,10 @@
 import type { Server as HttpServer } from "node:http";
 import type { Server, Socket } from "socket.io";
 
-export type Phase = "LOBBY" | "CHAT" | "VOTE" | "REVEAL" | "END";
+export type Phase = "LOBBY" | "CHAT" | "VOTE" | "DEFENSE" | "REVEAL" | "END";
 export type Winner = "HUMAN" | "AI" | "NONE";
 export type AiSetting = number | "random";
+export type Difficulty = "mild" | "spicy";
 
 export interface Persona {
   age: number;
@@ -15,6 +16,7 @@ export interface Persona {
 
 export interface HumanPlayer {
   id: string;
+  publicId: string;
   nickname: string;
   socketId?: string;
   connected: boolean;
@@ -24,6 +26,8 @@ export interface HumanPlayer {
   isSpectator: boolean;
   anonName?: string;
   alive: boolean;
+  spectatorScore: number;
+  spectatorBets: Map<number, string>;
 }
 
 export interface Participant {
@@ -38,6 +42,7 @@ export interface Participant {
   roundMessageCount: number;
   lastSpokeAt: number;
   speaking: boolean;
+  speechGeneration: number;
 }
 
 export interface ChatMessage {
@@ -56,6 +61,27 @@ export interface RoomSettings {
   aiCount: AiSetting;
   rounds: number;
   spectatorMode: boolean;
+  difficulty: Difficulty;
+}
+
+export interface InterrogationState {
+  by: string;
+  target: string;
+  question: string;
+  endsAt: number;
+  answered: boolean;
+}
+
+export interface VoteHistoryEntry {
+  round: number;
+  items: VoteRecord[];
+}
+
+export interface GameAward {
+  id: "humanlike_ai" | "most_suspected_human" | "detective";
+  title: string;
+  recipient: string;
+  detail: string;
 }
 
 export interface Room {
@@ -72,13 +98,21 @@ export interface Room {
   currentRound: number;
   questionCard?: string;
   usedQuestions: Set<string>;
+  interrogationUsed: boolean;
+  interrogation?: InterrogationState;
+  interrogationTimer?: NodeJS.Timeout;
   phaseEndsAt?: number;
   phaseTimer?: NodeJS.Timeout;
   aiScheduler?: NodeJS.Timeout;
   scheduledAiStarts: number[];
   chats: ChatMessage[];
   votes: Map<string, VoteRecord>;
+  voteHistory: VoteHistoryEntry[];
   aiVoteTasks: Promise<void>[];
+  defenseTarget?: string;
+  defenseMessageSent: boolean;
+  pendingVoteItems?: VoteRecord[];
+  resolvedBetRounds: Set<number>;
   transitioning: boolean;
   lastChatAt: number;
   lastReveal?: RevealPayload;

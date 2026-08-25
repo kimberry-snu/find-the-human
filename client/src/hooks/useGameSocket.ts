@@ -2,16 +2,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import type {
   AiCount,
+  BetLeaderboardEntry,
   ChatMessage,
+  Difficulty,
+  GameAward,
   GameActions,
   GamePhase,
   GameResult,
   GameViewState,
   IdentityReveal,
+  Interrogation,
   RoomPlayer,
   RoomSettings,
   SessionIdentity,
   StartSettings,
+  SpectatorBet,
   VoteItem,
   VoteReveal,
   EliminatedPlayer,
@@ -23,6 +28,7 @@ const DEFAULT_SETTINGS: RoomSettings = {
   aiCount: 'random',
   rounds: 3,
   spectatorMode: false,
+  difficulty: 'mild',
 };
 
 type UnknownRecord = Record<string, unknown>;
@@ -58,11 +64,21 @@ function booleanFrom(...values: unknown[]): boolean | undefined {
 function normalizePhase(value: unknown): GamePhase | null {
   if (typeof value !== 'string') return null;
   const phase = value.toUpperCase();
-  if (phase === 'LOBBY' || phase === 'CHAT' || phase === 'VOTE' || phase === 'REVEAL') {
+  if (
+    phase === 'LOBBY' ||
+    phase === 'CHAT' ||
+    phase === 'VOTE' ||
+    phase === 'DEFENSE' ||
+    phase === 'REVEAL'
+  ) {
     return phase;
   }
   if (phase === 'END' || phase === 'ENDED' || phase === 'GAME_OVER') return 'END';
   return null;
+}
+
+function parseDifficulty(value: unknown, fallback: Difficulty): Difficulty {
+  return value === 'mild' || value === 'spicy' ? value : fallback;
 }
 
 function parseAiCount(value: unknown, fallback: AiCount): AiCount {
@@ -160,7 +176,13 @@ function parseVoteReveal(value: unknown): VoteReveal | null {
     const voter = stringFrom(item.voter, item.from);
     const target = stringFrom(item.target, item.to);
     if (!voter || !target) return [];
-    return [{ voter, target, reason: stringFrom(item.reason) ?? '이유를 밝히지 않음' }];
+    return [
+      {
+        voter,
+        target,
+        reason: stringFrom(item.reason) ?? '이유를 밝히지 않음',
+      },
+    ];
   });
 
   const eliminated = parseEliminatedPlayer(value.eliminated);
@@ -190,7 +212,43 @@ function parseGameResult(value: unknown): GameResult | null {
       },
     ];
   });
-  return { winner, reveal };
+  const rawAwards = Array.isArray(value.awards) ? value.awards : [];
+  const awards: GameAward[] = rawAwards.flatMap((item) => {
+    if (!isRecord(item)) return [];
+    const id = stringFrom(item.id);
+    const title = stringFrom(item.title);
+    const recipient = stringFrom(item.recipient);
+    const detail = stringFrom(item.detail);
+    if (!id || !title || !recipient || !detail) return [];
+    return [{ id, title, recipient, detail }];
+  });
+  const rawBetLeaderboard = Array.isArray(value.betLeaderboard) ? value.betLeaderboard : [];
+  const betLeaderboard: BetLeaderboardEntry[] = rawBetLeaderboard.flatMap((item) => {
+    if (!isRecord(item)) return [];
+    const nickname = stringFrom(item.nickname);
+    const score = numberFrom(item.score);
+    const total = numberFrom(item.total);
+    if (!nickname || score === undefined || total === undefined) return [];
+    return [{ nickname, score, total }];
+  });
+  return { winner, reveal, awards, betLeaderboard };
+}
+
+function parseInterrogation(value: unknown): Interrogation | null {
+  if (!isRecord(value)) return null;
+  const target = stringFrom(value.target);
+  const question = stringFrom(value.question);
+  const endsAt = numberFrom(value.endsAt);
+  if (!target || !question || endsAt === undefined) return null;
+  return { target, question, endsAt };
+}
+
+function parseSpectatorBet(value: unknown): SpectatorBet | null {
+  if (!isRecord(value)) return null;
+  const round = numberFrom(value.round);
+  const targetAnonName = stringFrom(value.targetAnonName, value.target);
+  if (round === undefined || !targetAnonName) return null;
+  return { round, targetAnonName };
 }
 
 function participantNames(value: unknown): string[] | null {
@@ -232,6 +290,11 @@ function initialState(session: SessionIdentity | null): GameViewState {
     round: 0,
     totalRounds: DEFAULT_SETTINGS.rounds,
     questionCard: null,
+    defenseTarget: null,
+    defenseMessageSent: false,
+    interrogation: null,
+    interrogationUsed: false,
+    spectatorBet: null,
     messages: [],
     typingNames: [],
     reveal: null,
@@ -242,7 +305,10 @@ function initialState(session: SessionIdentity | null): GameViewState {
   };
 }
 
-export function useGameSocket(): { state: GameViewState; actions: GameActions } {
+export function useGameSocket(): {
+  state: GameViewState;
+  actions: GameActions;
+} {
   const initialSession = useMemo(readSession, []);
   const [state, setState] = useState<GameViewState>(() => initialState(initialSession));
   const sessionRef = useRef<SessionIdentity | null>(initialSession);
@@ -324,7 +390,11 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
 
   useEffect(() => {
     const onConnect = async () => {
-      setState((current) => ({ ...current, connected: true, connecting: false }));
+      setState((current) => ({
+        ...current,
+        connected: true,
+        connecting: false,
+      }));
       const cachedSession = sessionRef.current;
       if (!cachedSession) {
         setState((current) => ({ ...current, reconnecting: false }));
@@ -372,11 +442,21 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
     };
 
     const onDisconnect = () => {
-      setState((current) => ({ ...current, connected: false, connecting: false, busy: false }));
+      setState((current) => ({
+        ...current,
+        connected: false,
+        connecting: false,
+        busy: false,
+      }));
     };
 
     const onConnectError = () => {
-      setState((current) => ({ ...current, connected: false, connecting: false, reconnecting: false }));
+      setState((current) => ({
+        ...current,
+        connected: false,
+        connecting: false,
+        reconnecting: false,
+      }));
     };
 
     const onRoomState = (payload: unknown) => {
@@ -393,7 +473,11 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
             return parsed ? [parsed] : [];
           })
         : null;
-      const rawSettings = isRecord(payload.settings) ? payload.settings : {};
+      const rawSettings = isRecord(payload.settings)
+        ? payload.settings
+        : isRecord(nestedGame.settings)
+          ? nestedGame.settings
+          : {};
       const phase = normalizePhase(payload.phase ?? nestedGame.phase);
       const lifecycle = stringFrom(payload.status, payload.state, nestedGame.status)?.toUpperCase();
       const isLobby = phase === 'LOBBY' || lifecycle === 'LOBBY';
@@ -404,12 +488,30 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
         payload.messages ?? payload.chatLog ?? nestedGame.messages ?? nestedGame.chatLog,
       );
       const restoredReveal = parseVoteReveal(payload.reveal ?? nestedGame.reveal);
-      const restoredResult = parseGameResult(payload.result ?? payload.gameOver ?? nestedGame.result);
+      const restoredResult = parseGameResult(
+        payload.result ?? payload.gameOver ?? nestedGame.result,
+      );
       const restoredParticipants = participantNames(
         payload.participants ?? nestedGame.participants,
       );
       const restoredEliminationHistory = parseEliminationHistory(
         payload.eliminationHistory ?? nestedGame.eliminationHistory,
+      );
+      const restoredDefenseTarget =
+        stringFrom(payload.defenseTarget, nestedGame.defenseTarget) ?? null;
+      const restoredDefenseMessageSent = booleanFrom(
+        payload.defenseMessageSent,
+        nestedGame.defenseMessageSent,
+      );
+      const restoredInterrogation = parseInterrogation(
+        payload.interrogation ?? nestedGame.interrogation,
+      );
+      const restoredInterrogationUsed = booleanFrom(
+        payload.interrogationUsed,
+        nestedGame.interrogationUsed,
+      );
+      const restoredSpectatorBet = parseSpectatorBet(
+        payload.spectatorBet ?? nestedGame.spectatorBet,
       );
       const roomCode = sanitizeRoomCode(
         stringFrom(payload.code, payload.roomCode) ?? sessionRef.current?.roomCode ?? '',
@@ -422,8 +524,8 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
             1,
             Math.round(numberFrom(rawSettings.rounds) ?? current.settings.rounds),
           ),
-          spectatorMode:
-            booleanFrom(rawSettings.spectatorMode) ?? current.settings.spectatorMode,
+          spectatorMode: booleanFrom(rawSettings.spectatorMode) ?? current.settings.spectatorMode,
+          difficulty: parseDifficulty(rawSettings.difficulty, current.settings.difficulty),
         };
         const currentPlayerId = sessionRef.current?.playerId ?? current.playerId;
         const self = players?.find((player) => player.id === currentPlayerId);
@@ -462,6 +564,11 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
             round: 0,
             totalRounds: nextSettings.rounds,
             questionCard: null,
+            defenseTarget: null,
+            defenseMessageSent: false,
+            interrogation: null,
+            interrogationUsed: false,
+            spectatorBet: null,
             messages: [],
             typingNames: [],
             reveal: null,
@@ -495,6 +602,7 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
             current.gameStarted ||
             phase === 'CHAT' ||
             phase === 'VOTE' ||
+            phase === 'DEFENSE' ||
             phase === 'REVEAL' ||
             phase === 'END' ||
             lifecycle === 'PLAYING' ||
@@ -509,6 +617,20 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
           round: round ?? current.round,
           totalRounds: nextSettings.rounds,
           questionCard: questionCard ?? current.questionCard,
+          defenseTarget:
+            (restoredResult ? 'END' : (phase ?? current.phase)) === 'DEFENSE'
+              ? restoredDefenseTarget
+              : null,
+          defenseMessageSent:
+            (restoredResult ? 'END' : (phase ?? current.phase)) === 'DEFENSE'
+              ? (restoredDefenseMessageSent ?? current.defenseMessageSent)
+              : false,
+          interrogation:
+            (restoredResult ? 'END' : (phase ?? current.phase)) === 'CHAT'
+              ? restoredInterrogation
+              : null,
+          interrogationUsed: restoredInterrogationUsed ?? current.interrogationUsed,
+          spectatorBet: restoredSpectatorBet,
           messages: restoredMessages ?? current.messages,
           reveal: restoredReveal ?? current.reveal,
           result: restoredResult ?? current.result,
@@ -532,6 +654,11 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
         phase: 'CHAT',
         round: numberFrom(payload.round) ?? 1,
         totalRounds: numberFrom(payload.rounds) ?? current.settings.rounds,
+        defenseTarget: null,
+        defenseMessageSent: false,
+        interrogation: null,
+        interrogationUsed: false,
+        spectatorBet: null,
         messages: [],
         typingNames: [],
         reveal: null,
@@ -545,24 +672,52 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
       if (!isRecord(payload)) return;
       const phase = normalizePhase(payload.phase);
       if (!phase) return;
+      setState((current) => {
+        const nextRound = numberFrom(payload.round) ?? current.round;
+        const enteringNewRound = phase === 'CHAT' && nextRound !== current.round;
+        const enteringDefense = phase === 'DEFENSE' && current.phase !== 'DEFENSE';
+        return {
+          ...current,
+          busy: false,
+          gameStarted: phase !== 'LOBBY',
+          phase,
+          endsAt: numberFrom(payload.endsAt) ?? null,
+          round: nextRound,
+          questionCard: stringFrom(payload.questionCard) ?? current.questionCard,
+          defenseTarget: phase === 'DEFENSE' ? (stringFrom(payload.defenseTarget) ?? null) : null,
+          defenseMessageSent:
+            phase === 'DEFENSE'
+              ? (booleanFrom(payload.defenseMessageSent) ??
+                (enteringDefense ? false : current.defenseMessageSent))
+              : false,
+          interrogation: phase === 'CHAT' ? current.interrogation : null,
+          interrogationUsed: phase === 'LOBBY' ? false : current.interrogationUsed,
+          spectatorBet: phase === 'LOBBY' || enteringNewRound ? null : current.spectatorBet,
+          reveal: phase === 'CHAT' ? null : current.reveal,
+          result: phase === 'LOBBY' ? null : current.result,
+          hasVoted:
+            phase === 'CHAT'
+              ? false
+              : phase === 'VOTE' && current.phase !== 'VOTE'
+                ? false
+                : current.hasVoted,
+          typingNames: phase === 'CHAT' ? current.typingNames : [],
+        };
+      });
+    };
+
+    const onInterrogationStart = (payload: unknown) => {
+      const interrogation = parseInterrogation(payload);
+      if (!interrogation) return;
       setState((current) => ({
         ...current,
-        busy: false,
-        gameStarted: phase !== 'LOBBY',
-        phase,
-        endsAt: numberFrom(payload.endsAt) ?? null,
-        round: numberFrom(payload.round) ?? current.round,
-        questionCard: stringFrom(payload.questionCard) ?? current.questionCard,
-        reveal: phase === 'CHAT' ? null : current.reveal,
-        result: phase === 'LOBBY' ? null : current.result,
-        hasVoted:
-          phase === 'CHAT'
-            ? false
-            : phase === 'VOTE' && current.phase !== 'VOTE'
-              ? false
-              : current.hasVoted,
-        typingNames: phase === 'CHAT' ? current.typingNames : [],
+        interrogation,
+        interrogationUsed: true,
       }));
+    };
+
+    const onInterrogationEnd = () => {
+      setState((current) => ({ ...current, interrogation: null }));
     };
 
     const onChatNew = (payload: unknown) => {
@@ -577,22 +732,26 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
         return {
           ...current,
           messages: [...current.messages.slice(-299), message],
-          typingNames: current.typingNames.filter((name) => name !== from),
+          defenseMessageSent:
+            current.phase === 'DEFENSE' && current.yourAnonName === from
+              ? true
+              : current.defenseMessageSent,
+          typingNames: [],
         };
       });
     };
 
     const onChatTyping = (payload: unknown) => {
-      if (!isRecord(payload)) return;
-      const from = stringFrom(payload.from);
-      const isTyping = booleanFrom(payload.isTyping);
-      if (!from || isTyping === undefined) return;
-      setState((current) => {
-        const typing = new Set(current.typingNames);
-        if (isTyping) typing.add(from);
-        else typing.delete(from);
-        return { ...current, typingNames: [...typing] };
-      });
+      const isTyping = isRecord(payload)
+        ? booleanFrom(payload.isTyping)
+        : booleanFrom(payload);
+      if (isTyping === undefined) return;
+      // Deliberately ignore the sender field. Typing activity must never reveal
+      // which anonymous participant is an AI before messages are published.
+      setState((current) => ({
+        ...current,
+        typingNames: isTyping ? ['anonymous'] : [],
+      }));
     };
 
     const onVoteReveal = (payload: unknown) => {
@@ -602,11 +761,11 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
         const eliminatedNames = new Set(current.eliminatedNames);
         if (reveal.eliminated) eliminatedNames.add(reveal.eliminated.anonName);
         const selfEliminated = reveal.eliminated?.anonName === current.yourAnonName;
-        const eliminationHistory = reveal.eliminated && !current.eliminationHistory.some(
-          (item) => item.anonName === reveal.eliminated?.anonName,
-        )
-          ? [...current.eliminationHistory, reveal.eliminated]
-          : current.eliminationHistory;
+        const eliminationHistory =
+          reveal.eliminated &&
+          !current.eliminationHistory.some((item) => item.anonName === reveal.eliminated?.anonName)
+            ? [...current.eliminationHistory, reveal.eliminated]
+            : current.eliminationHistory;
         if (reveal.automatic) {
           return {
             ...current,
@@ -620,6 +779,9 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
         return {
           ...current,
           phase: 'REVEAL',
+          defenseTarget: null,
+          defenseMessageSent: false,
+          interrogation: null,
           reveal,
           eliminatedNames,
           eliminationHistory,
@@ -627,7 +789,6 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
           typingNames: [],
         };
       });
-
     };
 
     const onGameOver = (payload: unknown) => {
@@ -639,6 +800,9 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
         gameStarted: true,
         phase: 'END',
         endsAt: null,
+        defenseTarget: null,
+        defenseMessageSent: false,
+        interrogation: null,
         typingNames: [],
         result,
       }));
@@ -656,16 +820,41 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
       }));
     };
 
+    const onRoomClosed = (payload: unknown) => {
+      const message = isRecord(payload)
+        ? stringFrom(payload.message, payload.reason)
+        : stringFrom(payload);
+      rejoinAttemptRef.current += 1;
+      sessionRef.current = null;
+      persistSession(null);
+      noticeIdRef.current += 1;
+      const noticeId = noticeIdRef.current;
+      setState((current) => ({
+        ...initialState(null),
+        connected: current.connected,
+        connecting: false,
+        reconnecting: false,
+        notice: {
+          id: noticeId,
+          message: message ?? '방이 종료되어 시작 화면으로 돌아왔어요',
+          tone: 'info',
+        },
+      }));
+    };
+
     socket.on('connect', onConnect);
     socket.on('disconnect', onDisconnect);
     socket.on('connect_error', onConnectError);
     socket.on('room:state', onRoomState);
     socket.on('game:start', onGameStart);
     socket.on('phase:change', onPhaseChange);
+    socket.on('interrogation:start', onInterrogationStart);
+    socket.on('interrogation:end', onInterrogationEnd);
     socket.on('chat:new', onChatNew);
     socket.on('chat:typing', onChatTyping);
     socket.on('vote:reveal', onVoteReveal);
     socket.on('game:over', onGameOver);
+    socket.on('room:closed', onRoomClosed);
     socket.on('error', onServerError);
     socket.connect();
 
@@ -677,10 +866,13 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
       socket.off('room:state', onRoomState);
       socket.off('game:start', onGameStart);
       socket.off('phase:change', onPhaseChange);
+      socket.off('interrogation:start', onInterrogationStart);
+      socket.off('interrogation:end', onInterrogationEnd);
       socket.off('chat:new', onChatNew);
       socket.off('chat:typing', onChatTyping);
       socket.off('vote:reveal', onVoteReveal);
       socket.off('game:over', onGameOver);
+      socket.off('room:closed', onRoomClosed);
       socket.off('error', onServerError);
       socket.disconnect();
     };
@@ -699,7 +891,8 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
       }
       setState((current) => ({ ...current, busy: true }));
       try {
-        const payload = event === 'room:create' ? { nickname: cleanNickname } : { nickname: cleanNickname, code };
+        const payload =
+          event === 'room:create' ? { nickname: cleanNickname } : { nickname: cleanNickname, code };
         const response = await emitWithAck(event, payload);
         const roomCode = sanitizeRoomCode(
           stringFrom(response.code, response.roomCode) ?? code ?? '',
@@ -746,12 +939,28 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
   );
 
   const sendChat = useCallback(
-    (text: string) => {
+    async (text: string): Promise<void> => {
       const cleanText = text.trim().slice(0, 140);
-      if (!cleanText || !socket.connected) return;
-      socket.emit('chat:send', { text: cleanText });
+      if (!cleanText) {
+        const error = new Error('메시지를 입력해 주세요');
+        notify(error.message, 'error');
+        throw error;
+      }
+      if (!socket.connected) {
+        const error = new Error('서버에 다시 연결한 뒤 보내 주세요');
+        notify(error.message, 'error');
+        throw error;
+      }
+      try {
+        await emitWithAck('chat:send', { text: cleanText });
+      } catch (error) {
+        const normalizedError =
+          error instanceof Error ? error : new Error('메시지를 보내지 못했어요');
+        notify(normalizedError.message, 'error');
+        throw normalizedError;
+      }
     },
-    [socket],
+    [emitWithAck, notify, socket],
   );
 
   const castVote = useCallback(
@@ -761,6 +970,42 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
       socket.emit('vote:cast', { targetAnonName });
     },
     [socket],
+  );
+
+  const useInterrogation = useCallback(
+    (targetAnonName: string) => {
+      if (!targetAnonName || !socket.connected) return;
+      void emitWithAck('interrogation:use', { targetAnonName }).catch((error) => {
+        notify(error instanceof Error ? error.message : '심문 카드를 사용하지 못했어요', 'error');
+      });
+    },
+    [emitWithAck, notify, socket],
+  );
+
+  const placeSpectatorBet = useCallback(
+    (targetAnonName: string) => {
+      if (!targetAnonName || !socket.connected) return;
+      const requestedRound = state.round;
+      void emitWithAck('spectator:bet', { targetAnonName })
+        .then((response) => {
+          const acknowledgedBet = parseSpectatorBet(
+            response.spectatorBet ??
+              response.bet ?? {
+                round: requestedRound,
+                targetAnonName,
+              },
+          );
+          if (!acknowledgedBet) return;
+          setState((current) => ({
+            ...current,
+            spectatorBet: acknowledgedBet,
+          }));
+        })
+        .catch((error) => {
+          notify(error instanceof Error ? error.message : '예측을 등록하지 못했어요', 'error');
+        });
+    },
+    [emitWithAck, notify, socket, state.round],
   );
 
   const playAgain = useCallback(() => {
@@ -782,6 +1027,11 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
       endsAt: null,
       round: 0,
       questionCard: null,
+      defenseTarget: null,
+      defenseMessageSent: false,
+      interrogation: null,
+      interrogationUsed: false,
+      spectatorBet: null,
       messages: [],
       typingNames: [],
       reveal: null,
@@ -798,11 +1048,24 @@ export function useGameSocket(): { state: GameViewState; actions: GameActions } 
       startGame,
       sendChat,
       castVote,
+      useInterrogation,
+      placeSpectatorBet,
       playAgain,
       dismissNotice,
       notify,
     }),
-    [castVote, createRoom, dismissNotice, joinRoom, notify, playAgain, sendChat, startGame],
+    [
+      castVote,
+      createRoom,
+      dismissNotice,
+      joinRoom,
+      notify,
+      placeSpectatorBet,
+      playAgain,
+      sendChat,
+      startGame,
+      useInterrogation,
+    ],
   );
 
   return { state, actions };

@@ -153,6 +153,14 @@
   animation: urgent 1s ease-in-out infinite;
 }
 
+.animate-interrogation {
+  animation: interrogation-pulse 1.4s ease-in-out infinite;
+}
+
+.animate-defense-glow {
+  animation: defense-glow 2.6s ease-in-out infinite;
+}
+
 @keyframes typing-bounce {
   0%,
   60%,
@@ -256,6 +264,20 @@
   50% {
     box-shadow: 0 0 18px rgba(255, 93, 115, 0.2);
     opacity: 0.74;
+  }
+}
+
+@keyframes interrogation-pulse {
+  50% {
+    border-color: rgba(255, 93, 115, 0.58);
+    box-shadow: 0 0 26px rgba(255, 93, 115, 0.13);
+  }
+}
+
+@keyframes defense-glow {
+  50% {
+    opacity: 0.62;
+    transform: scale(1.08);
   }
 }
 

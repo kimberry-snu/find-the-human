@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { avatarFor, avatarToneFor } from '../lib/game-utils';
 import type { AiCount, Notice, RoomPlayer, RoomSettings, StartSettings } from '../types';
 import { BrandMark } from './BrandMark';
@@ -19,6 +19,14 @@ interface LobbyScreenProps {
 const AI_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8] as const;
 const ROUND_COUNTS = [1, 2, 3, 4, 5] as const;
 
+function buildInviteUrl(roomCode: string): string {
+  const url = new URL(window.location.href);
+  url.search = '';
+  url.hash = '';
+  url.searchParams.set('room', roomCode);
+  return url.toString();
+}
+
 export function LobbyScreen({
   roomCode,
   playerId,
@@ -33,14 +41,56 @@ export function LobbyScreen({
   const [aiCount, setAiCount] = useState<AiCount>(settings.aiCount);
   const [rounds, setRounds] = useState(settings.rounds);
   const [spectatorMode, setSpectatorMode] = useState(settings.spectatorMode);
+  const [difficulty, setDifficulty] = useState<RoomSettings['difficulty']>(
+    settings.difficulty ?? 'mild',
+  );
   const [touched, setTouched] = useState(false);
+  const [showQr, setShowQr] = useState(false);
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [qrFailed, setQrFailed] = useState(false);
+  const inviteUrl = useMemo(() => buildInviteUrl(roomCode), [roomCode]);
 
   useEffect(() => {
     if (touched) return;
     setAiCount(settings.aiCount);
     setRounds(settings.rounds);
     setSpectatorMode(settings.spectatorMode);
-  }, [settings.aiCount, settings.rounds, settings.spectatorMode, touched]);
+    setDifficulty(settings.difficulty ?? 'mild');
+  }, [settings.aiCount, settings.difficulty, settings.rounds, settings.spectatorMode, touched]);
+
+  useEffect(() => {
+    if (!showQr || qrDataUrl || qrFailed) return;
+    let cancelled = false;
+
+    void import('qrcode')
+      .then(({ toDataURL }) =>
+        toDataURL(inviteUrl, {
+          width: 256,
+          margin: 2,
+          color: { dark: '#07080b', light: '#ffffff' },
+          errorCorrectionLevel: 'M',
+        }),
+      )
+      .then((dataUrl) => {
+        if (!cancelled) setQrDataUrl(dataUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setQrFailed(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [inviteUrl, qrDataUrl, qrFailed, showQr]);
+
+  useEffect(() => {
+    if (!showQr) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setShowQr(false);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [showQr]);
 
   const isHost = hostId === playerId || players.some((player) => player.id === playerId && player.isHost);
   const connectedPlayers = players.filter((player) => player.connected);
@@ -59,6 +109,32 @@ export function LobbyScreen({
       onNotify('초대코드를 복사했어요', 'success');
     } catch {
       onNotify(`초대코드: ${roomCode}`, 'info');
+    }
+  };
+
+  const copyInviteLink = async () => {
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      onNotify('초대 링크를 복사했어요', 'success');
+    } catch {
+      onNotify('링크를 복사하지 못했어요', 'error');
+    }
+  };
+
+  const shareInvite = async () => {
+    if (!navigator.share) {
+      await copyInviteLink();
+      return;
+    }
+    try {
+      await navigator.share({
+        title: '인간을 찾아라',
+        text: `초대코드 ${roomCode} · AI 사이에 숨은 인간을 찾아보세요!`,
+        url: inviteUrl,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      onNotify('공유하지 못했어요', 'error');
     }
   };
 
@@ -94,6 +170,30 @@ export function LobbyScreen({
         <p className="mt-4 text-xs font-medium text-white/35">
           친구를 초대하거나, 혼자서 바로 AI와 게임을 시작하세요.
         </p>
+        <div className="mt-4 grid grid-cols-3 gap-2">
+          <button
+            type="button"
+            onClick={() => void copyInviteLink()}
+            className="h-10 rounded-xl border border-white/10 bg-white/[0.05] text-[10px] font-black text-white/65 transition hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric"
+          >
+            링크 복사
+          </button>
+          <button
+            type="button"
+            onClick={() => void shareInvite()}
+            className="h-10 rounded-xl border border-white/10 bg-white/[0.05] text-[10px] font-black text-white/65 transition hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric"
+          >
+            공유하기
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowQr(true)}
+            className="h-10 rounded-xl border border-electric/15 bg-electric/[0.06] text-[10px] font-black text-electric-soft/80 transition hover:bg-electric/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric"
+            aria-haspopup="dialog"
+          >
+            QR 띄우기
+          </button>
+        </div>
       </section>
 
       <section className="mt-7">
@@ -215,6 +315,51 @@ export function LobbyScreen({
 
           <div>
             <div className="mb-2.5 flex items-center justify-between">
+              <p className="text-xs font-extrabold text-white/70">AI 추리 난이도</p>
+              <span className="text-[10px] font-semibold text-white/30">순한맛 추천</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  markTouched();
+                  setDifficulty('mild');
+                }}
+                aria-pressed={difficulty === 'mild'}
+                className={`min-h-[74px] rounded-2xl border p-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric ${
+                  difficulty === 'mild'
+                    ? 'border-electric/35 bg-electric/[0.09] text-white'
+                    : 'border-white/[0.07] bg-white/[0.035] text-white/45'
+                }`}
+              >
+                <span className="block text-xs font-black">🌿 순한맛 <span className="text-[9px] text-electric/70">추천</span></span>
+                <span className="mt-1 block text-[9px] font-semibold leading-4 text-white/35">
+                  AI가 실수해서 더 유쾌해요
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  markTouched();
+                  setDifficulty('spicy');
+                }}
+                aria-pressed={difficulty === 'spicy'}
+                className={`min-h-[74px] rounded-2xl border p-3 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-signal ${
+                  difficulty === 'spicy'
+                    ? 'border-signal/35 bg-signal/[0.09] text-white'
+                    : 'border-white/[0.07] bg-white/[0.035] text-white/45'
+                }`}
+              >
+                <span className="block text-xs font-black">🌶️ 매운맛</span>
+                <span className="mt-1 block text-[9px] font-semibold leading-4 text-white/35">
+                  AI가 대화를 날카롭게 추리해요
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <div className="mb-2.5 flex items-center justify-between">
               <p className="text-xs font-extrabold text-white/70">라운드 수</p>
               <span className="text-[10px] font-semibold text-white/30">기본 3라운드</span>
             </div>
@@ -277,7 +422,7 @@ export function LobbyScreen({
           <div className="mt-5">
             <button
               type="button"
-              onClick={() => onStart({ aiCount, rounds, spectatorMode })}
+              onClick={() => onStart({ aiCount, rounds, spectatorMode, difficulty })}
               disabled={!canStart || busy}
               className="flex h-[54px] w-full items-center justify-between rounded-2xl bg-signal px-5 text-sm font-black text-white shadow-signal transition hover:bg-signal-soft focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-signal focus-visible:ring-offset-2 focus-visible:ring-offset-ink-950 disabled:cursor-not-allowed disabled:opacity-35 disabled:shadow-none"
             >
@@ -311,6 +456,57 @@ export function LobbyScreen({
           </div>
         )}
       </section>
+
+      {showQr ? (
+        <div
+          className="fixed inset-0 z-50 grid place-items-center bg-black/80 p-5 backdrop-blur-sm"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setShowQr(false);
+          }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="qr-title"
+            aria-describedby="qr-description"
+            className="w-full max-w-sm animate-sheet-in rounded-[28px] border border-white/10 bg-ink-900 p-5 text-center shadow-2xl"
+          >
+            <p className="text-[10px] font-black uppercase tracking-[0.2em] text-electric/65">Scan to join</p>
+            <h2 id="qr-title" className="mt-2 text-xl font-black text-white">카메라로 바로 참가</h2>
+            <p id="qr-description" className="mt-2 text-xs font-medium leading-5 text-white/35">
+              QR을 찍으면 초대코드가 자동으로 채워져요.
+            </p>
+            <div className="mx-auto mt-5 grid aspect-square w-64 max-w-full place-items-center overflow-hidden rounded-3xl bg-white p-3">
+              {qrDataUrl ? (
+                <img src={qrDataUrl} alt={`${roomCode} 방 참가 QR 코드`} className="h-full w-full" />
+              ) : qrFailed ? (
+                <p className="px-5 text-xs font-bold leading-5 text-black/60">QR을 만들지 못했어요.<br />링크 복사를 이용해 주세요.</p>
+              ) : (
+                <div className="text-xs font-black text-black/45" role="status">QR 만드는 중…</div>
+              )}
+            </div>
+            <p className="mt-4 font-mono text-2xl font-black tracking-[0.2em] text-white">{roomCode}</p>
+            <div className="mt-5 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => void copyInviteLink()}
+                className="h-11 rounded-xl bg-white text-xs font-black text-black focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric"
+              >
+                링크 복사
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowQr(false)}
+                autoFocus
+                className="h-11 rounded-xl border border-white/10 bg-white/[0.06] text-xs font-black text-white/65 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-electric"
+              >
+                닫기
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }

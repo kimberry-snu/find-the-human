@@ -3,6 +3,14 @@ import { sanitizeRoomCode } from '../lib/game-utils';
 import { ArrowIcon, UsersIcon } from './icons';
 import { BrandMark } from './BrandMark';
 
+function invitedRoomFromUrl(): string {
+  try {
+    return sanitizeRoomCode(new URL(window.location.href).searchParams.get('room') ?? '');
+  } catch {
+    return '';
+  }
+}
+
 interface HomeScreenProps {
   connected: boolean;
   connecting: boolean;
@@ -21,8 +29,9 @@ export function HomeScreen({
   const nicknameId = useId();
   const codeId = useId();
   const [nickname, setNickname] = useState('');
-  const [code, setCode] = useState('');
+  const [code, setCode] = useState(invitedRoomFromUrl);
   const unavailable = busy || !connected;
+  const wasInvited = code.length === 4;
 
   const handleJoin = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -65,6 +74,19 @@ export function HomeScreen({
       </section>
 
       <section className="relative mt-9 rounded-[28px] border border-white/[0.08] bg-white/[0.035] p-4 shadow-2xl backdrop-blur-xl">
+        {wasInvited ? (
+          <div className="mb-4 flex items-center gap-3 rounded-2xl border border-electric/15 bg-electric/[0.055] px-3.5 py-3" role="status">
+            <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-electric/10 text-lg" aria-hidden="true">
+              ✉️
+            </span>
+            <div className="min-w-0">
+              <p className="text-[10px] font-black uppercase tracking-[0.15em] text-electric/60">Invitation</p>
+              <p className="mt-0.5 text-xs font-extrabold text-white/75">
+                <span className="font-mono tracking-widest text-electric-soft">{code}</span> 방에 초대받았어요
+              </p>
+            </div>
+          </div>
+        ) : null}
         <label htmlFor={nicknameId} className="mb-2 block text-[11px] font-bold text-white/45">
           게임에서 사용할 닉네임
         </label>

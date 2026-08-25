@@ -1,9 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { ADJECTIVES, ANIMALS, MOCK_LINES, MOCK_REASONS, PERSONAS, QUESTION_CARDS } from "./content.js";
+import {
+  ADJECTIVES,
+  ANIMALS,
+  INTERROGATION_QUESTIONS,
+  MOCK_LINES,
+  MOCK_REASONS,
+  PERSONAS,
+  QUESTION_CARDS
+} from "./content.js";
 import { generateAiChat, generateAiVote, mockQuestionAnswer } from "./ai.js";
 import type {
   AiSetting,
+  Difficulty,
   EliminatedInfo,
+  GameAward,
   GameIo,
   GameSocket,
   HumanPlayer,
@@ -28,7 +38,9 @@ import {
 
 const CHAT_DURATION = 90_000;
 const VOTE_DURATION = 30_000;
+const DEFENSE_DURATION = 15_000;
 const REVEAL_DURATION = 15_000;
+const INTERROGATION_DURATION = 15_000;
 const RECONNECT_GRACE = 60_000;
 const AI_TICK = 3_000;
 const AI_COOLDOWN = 8_000;
@@ -43,7 +55,7 @@ const ROOM_ABSOLUTE_TTL = 2 * 60 * 60_000;
 const ROOM_SWEEP_INTERVAL = 60_000;
 
 const activeGamePhase = (room: Room): boolean =>
-  room.phase === "CHAT" || room.phase === "VOTE" || room.phase === "REVEAL";
+  room.phase === "CHAT" || room.phase === "VOTE" || room.phase === "DEFENSE" || room.phase === "REVEAL";
 
 const personaSummary = (persona?: Persona): string => {
   if (!persona) return "정체불명 AI";
@@ -74,6 +86,11 @@ const settingsAiCount = (value: unknown): AiSetting => {
   return parsed;
 };
 
+const settingsDifficulty = (value: unknown): Difficulty => {
+  if (value === "mild" || value === "spicy") return value;
+  throw new Error("난이도는 mild 또는 spicy여야 합니다");
+};
+
 export class GameEngine {
   readonly rooms = new Map<string, Room>();
 
@@ -98,15 +115,19 @@ export class GameEngine {
       hostId: player.id,
       humans: new Map([[player.id, player]]),
       phase: "LOBBY",
-      settings: { aiCount: 3, rounds: 3, spectatorMode: false },
+      settings: { aiCount: 3, rounds: 3, spectatorMode: false, difficulty: "mild" },
       participants: [],
       participantOrder: [],
       currentRound: 0,
       usedQuestions: new Set(),
+      interrogationUsed: false,
       scheduledAiStarts: [],
       chats: [],
       votes: new Map(),
+      voteHistory: [],
       aiVoteTasks: [],
+      defenseMessageSent: false,
+      resolvedBetRounds: new Set(),
       eliminationHistory: [],
       transitioning: false,
       lastChatAt: Date.now()
@@ -176,7 +197,7 @@ export class GameEngine {
 
   startGame(
     socket: GameSocket,
-    payload: { aiCount?: unknown; rounds?: unknown; spectatorMode?: unknown }
+    payload: { aiCount?: unknown; rounds?: unknown; spectatorMode?: unknown; difficulty?: unknown }
   ): void {
     const { room, player } = this.contextFor(socket);
     if (room.phase !== "LOBBY") throw new Error("이미 게임이 진행 중입니다");
@@ -185,12 +206,13 @@ export class GameEngine {
     const spectatorMode = payload.spectatorMode === true;
     const aiCountSetting = settingsAiCount(payload.aiCount ?? room.settings.aiCount);
     const rounds = clampInt(payload.rounds, 1, 10, room.settings.rounds);
+    const difficulty = settingsDifficulty(payload.difficulty ?? room.settings.difficulty);
     const connectedHumans = [...room.humans.values()].filter((human) => human.connected);
     if (connectedHumans.length < 1) {
       throw new Error(spectatorMode ? "관전 모드는 1명 이상 필요합니다" : "게임 시작에는 인간 1명 이상이 필요합니다");
     }
 
-    room.settings = { aiCount: aiCountSetting, rounds, spectatorMode };
+    room.settings = { aiCount: aiCountSetting, rounds, spectatorMode, difficulty };
     this.touchRoom(room);
     const randomMinimum = Math.min(8, Math.max(2, connectedHumans.length - 1));
     const randomMaximum = Math.min(8, Math.max(randomMinimum, connectedHumans.length + 2));
@@ -203,8 +225,15 @@ export class GameEngine {
     this.clearPhaseWork(room);
     room.currentRound = 0;
     room.usedQuestions.clear();
+    room.interrogationUsed = false;
+    room.interrogation = undefined;
     room.chats = [];
     room.votes.clear();
+    room.voteHistory = [];
+    room.defenseTarget = undefined;
+    room.defenseMessageSent = false;
+    room.pendingVoteItems = undefined;
+    room.resolvedBetRounds.clear();
     room.lastReveal = undefined;
     room.eliminationHistory = [];
     room.winner = undefined;
@@ -214,6 +243,8 @@ export class GameEngine {
       human.anonName = undefined;
       human.isSpectator = spectatorMode || !human.connected;
       human.alive = human.connected && !spectatorMode;
+      human.spectatorScore = 0;
+      human.spectatorBets.clear();
     }
 
     const humanParticipants = spectatorMode
@@ -228,7 +259,8 @@ export class GameEngine {
           answeredQuestion: false,
           roundMessageCount: 0,
           lastSpokeAt: 0,
-          speaking: false
+          speaking: false,
+          speechGeneration: 0
         }));
 
     const selectedPersonas = shuffle(PERSONAS).slice(0, room.resolvedAiCount);
@@ -241,7 +273,8 @@ export class GameEngine {
       answeredQuestion: false,
       roundMessageCount: 0,
       lastSpokeAt: 0,
-      speaking: false
+      speaking: false,
+      speechGeneration: 0
     }));
 
     room.participants = [...humanParticipants, ...aiParticipants];
@@ -261,15 +294,87 @@ export class GameEngine {
 
   sendChat(socket: GameSocket, rawText: unknown): void {
     const { room, player } = this.contextFor(socket);
-    if (room.phase !== "CHAT") throw new Error("지금은 채팅할 수 없습니다");
     const participant = this.participantForHuman(room, player.id);
     if (!participant?.alive || player.isSpectator) throw new Error("관전자는 채팅할 수 없습니다");
+    const isDefenseMessage = room.phase === "DEFENSE" && room.defenseTarget === participant.anonName;
+    if (room.phase !== "CHAT" && !isDefenseMessage) throw new Error("지금은 채팅할 수 없습니다");
+    if (isDefenseMessage && room.defenseMessageSent) throw new Error("최후 변론은 한 번만 할 수 있습니다");
     if (typeof rawText !== "string") throw new Error("메시지를 입력해 주세요");
     const text = rawText.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").trim();
     if (!text) throw new Error("빈 메시지는 보낼 수 없습니다");
     if (codePointLength(text) > 140) throw new Error("메시지는 140자까지 보낼 수 있습니다");
     this.touchRoom(room);
     this.publishChat(room, participant.anonName, text);
+    participant.roundMessageCount += 1;
+    participant.lastSpokeAt = Date.now();
+
+    if (isDefenseMessage) {
+      room.defenseMessageSent = true;
+      this.emitRoomState(room);
+      return;
+    }
+
+    if (room.interrogation?.target === participant.anonName && !room.interrogation.answered) {
+      room.interrogation.answered = true;
+      this.endInterrogation(room, true);
+    }
+  }
+
+  useInterrogation(socket: GameSocket, rawTarget: unknown): void {
+    const { room, player } = this.contextFor(socket);
+    if (room.phase !== "CHAT") throw new Error("심문은 채팅 시간에만 사용할 수 있습니다");
+    if (room.interrogationUsed) throw new Error("이번 게임의 심문권은 이미 사용했습니다");
+    const interrogator = this.participantForHuman(room, player.id);
+    if (!interrogator?.alive || player.isSpectator) throw new Error("생존한 참가자만 심문할 수 있습니다");
+    if (typeof rawTarget !== "string") throw new Error("심문 대상을 선택해 주세요");
+    const target = room.participants.find((entry) => entry.alive && entry.anonName === rawTarget);
+    if (!target) throw new Error("생존 중인 참가자만 심문할 수 있습니다");
+    if (target.id === interrogator.id) throw new Error("자기 자신은 심문할 수 없습니다");
+
+    const now = Date.now();
+    const endsAt = now + scaledMs(INTERROGATION_DURATION);
+    room.interrogationUsed = true;
+    room.interrogation = {
+      by: interrogator.anonName,
+      target: target.anonName,
+      question: pick(INTERROGATION_QUESTIONS),
+      endsAt,
+      answered: false
+    };
+    this.touchRoom(room);
+
+    // 라운드 막판에도 심문 대상에게 온전한 답변 시간을 보장한다.
+    if ((room.phaseEndsAt ?? 0) < endsAt) {
+      room.phaseEndsAt = endsAt;
+      if (room.phaseTimer) clearTimeout(room.phaseTimer);
+      room.phaseTimer = setTimeout(() => this.beginVote(room), Math.max(0, endsAt - Date.now()));
+      this.emitPhase(room);
+    }
+
+    const publicPayload = this.interrogationPayload(room);
+    this.io.to(room.code).emit("interrogation:start", publicPayload);
+    this.emitRoomState(room);
+    room.interrogationTimer = setTimeout(() => this.endInterrogation(room, false), scaledMs(INTERROGATION_DURATION));
+
+    if (target.isAI) void this.performForcedAiSpeech(room, target, "interrogated");
+  }
+
+  placeSpectatorBet(socket: GameSocket, rawTarget: unknown): { spectatorBet: { round: number; targetAnonName: string } } {
+    const { room, player } = this.contextFor(socket);
+    if (room.settings.spectatorMode) throw new Error("전원 AI 관전 모드에서는 베팅할 수 없습니다");
+    if (room.phase !== "CHAT" && room.phase !== "VOTE") {
+      throw new Error("베팅은 채팅 또는 투표 시간에만 할 수 있습니다");
+    }
+    if (!player.isSpectator) throw new Error("관전자만 인간 예측 베팅을 할 수 있습니다");
+    if (player.spectatorBets.has(room.currentRound)) throw new Error("이번 라운드에는 이미 베팅했습니다");
+    if (typeof rawTarget !== "string") throw new Error("베팅 대상을 선택해 주세요");
+    const target = room.participants.find((entry) => entry.alive && entry.anonName === rawTarget);
+    if (!target) throw new Error("생존 중인 참가자에게만 베팅할 수 있습니다");
+
+    player.spectatorBets.set(room.currentRound, target.anonName);
+    this.touchRoom(room);
+    this.emitRoomState(room);
+    return { spectatorBet: { round: room.currentRound, targetAnonName: target.anonName } };
   }
 
   castVote(socket: GameSocket, rawTarget: unknown): void {
@@ -303,7 +408,14 @@ export class GameEngine {
     room.resolvedAiCount = undefined;
     room.chats = [];
     room.votes.clear();
+    room.voteHistory = [];
     room.usedQuestions.clear();
+    room.interrogationUsed = false;
+    room.interrogation = undefined;
+    room.defenseTarget = undefined;
+    room.defenseMessageSent = false;
+    room.pendingVoteItems = undefined;
+    room.resolvedBetRounds.clear();
     room.lastReveal = undefined;
     room.eliminationHistory = [];
     room.winner = undefined;
@@ -317,6 +429,8 @@ export class GameEngine {
       human.anonName = undefined;
       human.isSpectator = false;
       human.alive = true;
+      human.spectatorScore = 0;
+      human.spectatorBets.clear();
     }
     this.assignHost(room, room.hostId || player.id);
     this.emitRoomState(room);
@@ -350,6 +464,9 @@ export class GameEngine {
     room.phase = "CHAT";
     room.currentRound += 1;
     room.lastReveal = undefined;
+    room.defenseTarget = undefined;
+    room.defenseMessageSent = false;
+    room.pendingVoteItems = undefined;
     room.votes.clear();
     room.aiVoteTasks = [];
     room.questionCard = this.nextQuestion(room);
@@ -371,6 +488,7 @@ export class GameEngine {
   private beginVote(room: Room): void {
     if (room.phase !== "CHAT" || room.transitioning) return;
     room.transitioning = true;
+    if (room.interrogation) this.endInterrogation(room, room.interrogation.answered);
     this.stopAiScheduler(room);
     this.ensureAiObligations(room);
     room.phase = "VOTE";
@@ -386,8 +504,8 @@ export class GameEngine {
         .filter((candidate) => candidate.alive && candidate.id !== ai.id)
         .map((candidate) => candidate.anonName);
       if (candidates.length === 0) continue;
-      const task = generateAiVote(ai, room, candidates).then((vote) => {
-        if (room.phase !== "VOTE" || !ai.alive) return;
+      const task = this.generateBalancedAiVote(ai, room, candidates).then((vote) => {
+        if (room.phase !== "VOTE" || !ai.alive || !room.participants.includes(ai)) return;
         if (!room.participants.some((candidate) => candidate.alive && candidate.anonName === vote.target)) return;
         room.votes.set(ai.anonName, { voter: ai.anonName, target: vote.target, reason: vote.reason });
       }).catch((error: unknown) => {
@@ -396,10 +514,60 @@ export class GameEngine {
       room.aiVoteTasks.push(task);
     }
 
-    room.phaseTimer = setTimeout(() => this.beginReveal(room), scaledMs(VOTE_DURATION));
+    room.phaseTimer = setTimeout(() => this.beginDefense(room), scaledMs(VOTE_DURATION));
   }
 
-  private beginReveal(room: Room): void {
+  private async generateBalancedAiVote(
+    ai: Participant,
+    room: Room,
+    candidates: string[]
+  ): Promise<{ target: string; reason: string }> {
+    const roll = Math.random();
+    const randomShare = room.settings.difficulty === "mild" ? 0.3 : 0.15;
+    const heuristicShare = room.settings.difficulty === "mild" ? 0.45 : 0.25;
+
+    if (roll < randomShare) {
+      return {
+        target: pick(candidates),
+        reason: pick(["촉이 얘라고 소리침ㅋㅋ", "걍 눈에 걸려서 찍음", "운명이 얘래;;", "내 감은 은근 맞음"])
+      };
+    }
+
+    if (roll < randomShare + heuristicShare) {
+      const entries = candidates
+        .map((name) => room.participants.find((participant) => participant.anonName === name))
+        .filter((participant): participant is Participant => participant !== undefined);
+      const huntQuiet = Math.random() < 0.5;
+      const extreme = huntQuiet
+        ? Math.min(...entries.map((participant) => participant.roundMessageCount))
+        : Math.max(...entries.map((participant) => participant.roundMessageCount));
+      const tied = entries.filter((participant) => participant.roundMessageCount === extreme);
+      return {
+        target: pick(tied).anonName,
+        reason: huntQuiet
+          ? pick(["말이 없어서 더 수상함", "조용히 숨는 거 다 보임", "한마디만 하고 잠수탐"])
+          : pick(["혼자 너무 열심히 떠듦ㅋㅋ", "말 많아서 오히려 티남", "계속 몰아가는 게 수상함"])
+      };
+    }
+
+    // API가 없는 매운맛은 LLM 몫까지 강한 발화량 휴리스틱으로 대체한다.
+    // 그렇지 않으면 60%가 무작위 폴백이 되어 순한맛보다 둔해지는 역전이 생긴다.
+    if (room.settings.difficulty === "spicy" && !process.env.OPENAI_API_KEY?.trim()) {
+      const entries = candidates
+        .map((name) => room.participants.find((participant) => participant.anonName === name))
+        .filter((participant): participant is Participant => participant !== undefined);
+      const loudestCount = Math.max(...entries.map((participant) => participant.roundMessageCount));
+      const loudest = entries.filter((participant) => participant.roundMessageCount === loudestCount);
+      return {
+        target: pick(loudest).anonName,
+        reason: pick(["제일 시끄러운 게 연막 같음", "계속 말 돌리는 거 딱 걸림", "과하게 떠드는 게 사람 티남"])
+      };
+    }
+
+    return generateAiVote(ai, room, candidates);
+  }
+
+  private beginDefense(room: Room): void {
     if (room.phase !== "VOTE" || room.transitioning) return;
     room.transitioning = true;
     if (room.phaseTimer) clearTimeout(room.phaseTimer);
@@ -425,18 +593,48 @@ export class GameEngine {
       if (aliveNames.has(item.target)) counts.set(item.target, (counts.get(item.target) ?? 0) + 1);
     }
 
-    let eliminated: EliminatedInfo | null = null;
+    let defenseTarget: string | undefined;
     if (counts.size > 0) {
       const maximum = Math.max(...counts.values());
       const tied = [...counts.entries()].filter(([, count]) => count === maximum).map(([name]) => name);
       // 동점 추첨은 한 번만 해야 한다. find 콜백 안에서 매번 뽑으면 후보마다
       // 결과가 바뀌어 드물게 아무도 일치하지 않는 플래키가 생긴다.
-      const eliminatedName = pick(tied);
-      const eliminatedParticipant = room.participants.find(
-        (participant) => participant.alive && participant.anonName === eliminatedName
-      );
-      if (eliminatedParticipant) eliminated = this.eliminate(room, eliminatedParticipant);
+      defenseTarget = pick(tied);
     }
+
+    room.voteHistory.push({ round: room.currentRound, items: items.map((item) => ({ ...item })) });
+    room.pendingVoteItems = items;
+    room.defenseTarget = defenseTarget;
+    room.defenseMessageSent = false;
+
+    if (!defenseTarget) {
+      room.transitioning = false;
+      this.beginReveal(room);
+      return;
+    }
+
+    room.phase = "DEFENSE";
+    room.transitioning = false;
+    this.setPhaseDeadline(room, DEFENSE_DURATION);
+    this.emitPhase(room);
+    this.emitRoomState(room);
+
+    const target = room.participants.find((participant) => participant.alive && participant.anonName === defenseTarget);
+    if (target?.isAI) void this.performForcedAiSpeech(room, target, "defense");
+    room.phaseTimer = setTimeout(() => this.beginReveal(room), scaledMs(DEFENSE_DURATION));
+  }
+
+  private beginReveal(room: Room): void {
+    if ((room.phase !== "DEFENSE" && room.phase !== "VOTE") || room.transitioning) return;
+    room.transitioning = true;
+    if (room.phaseTimer) clearTimeout(room.phaseTimer);
+
+    const items = room.pendingVoteItems ?? [];
+    const target = room.defenseTarget
+      ? room.participants.find((participant) => participant.alive && participant.anonName === room.defenseTarget)
+      : undefined;
+    const eliminated = target ? this.eliminate(room, target) : null;
+    this.resolveSpectatorBets(room);
 
     room.phase = "REVEAL";
     room.transitioning = false;
@@ -480,6 +678,14 @@ export class GameEngine {
     room.phaseEndsAt = Date.now();
     room.questionCard = undefined;
     this.touchRoom(room);
+    console.info(JSON.stringify({
+      event: "game_complete",
+      difficulty: room.settings.difficulty,
+      winner,
+      humans: room.participants.filter((participant) => !participant.isAI).length,
+      aiCount: room.participants.filter((participant) => participant.isAI).length,
+      roundsPlayed: room.currentRound
+    }));
     this.emitPhase(room);
     this.io.to(room.code).emit("game:over", this.gameOverPayload(room));
     this.emitRoomState(room);
@@ -511,6 +717,7 @@ export class GameEngine {
 
   private scheduleAiSpeech(room: Room, participant: Participant, trigger: "natural" | "question" | "mentioned"): void {
     if (participant.speaking || room.phase !== "CHAT") return;
+    const generation = ++participant.speechGeneration;
     participant.speaking = true;
     const now = Date.now();
     room.scheduledAiStarts = room.scheduledAiStarts.filter(
@@ -521,33 +728,54 @@ export class GameEngine {
     room.scheduledAiStarts.push(typingStart);
 
     setTimeout(() => {
-      if (room.phase !== "CHAT" || !participant.alive) {
-        participant.speaking = false;
+      if (
+        participant.speechGeneration !== generation ||
+        room.phase !== "CHAT" ||
+        !participant.alive ||
+        !room.participants.includes(participant)
+      ) {
+        if (participant.speechGeneration === generation) participant.speaking = false;
         return;
       }
-      void this.performAiSpeech(room, participant, trigger);
+      void this.performAiSpeech(room, participant, trigger, generation);
     }, Math.max(0, typingStart - now));
   }
 
   private async performAiSpeech(
     room: Room,
     participant: Participant,
-    trigger: "natural" | "question" | "mentioned"
+    trigger: "natural" | "question" | "mentioned",
+    generation: number
   ): Promise<void> {
-    this.io.to(room.code).emit("chat:typing", { from: participant.anonName, isTyping: true });
+    this.io.to(room.code).emit("chat:typing", { isTyping: true });
     try {
       const minimumDelay = scaledMs(randomBetween(1_500, 6_000));
       const [generated] = await Promise.all([
         generateAiChat(participant, room, trigger),
         sleep(minimumDelay)
       ]);
-      if (room.phase !== "CHAT" || !participant.alive) return;
+      if (
+        participant.speechGeneration !== generation ||
+        room.phase !== "CHAT" ||
+        !participant.alive ||
+        !room.participants.includes(participant)
+      ) return;
       const lines = generated.slice(0, 2).map((line) => this.postProcessAiText(line)).filter(Boolean);
-      this.io.to(room.code).emit("chat:typing", { from: participant.anonName, isTyping: false });
+      this.io.to(room.code).emit("chat:typing", { isTyping: false });
       for (let index = 0; index < lines.length; index += 1) {
-        if (room.phase !== "CHAT" || !participant.alive) break;
+        if (
+          participant.speechGeneration !== generation ||
+          room.phase !== "CHAT" ||
+          !participant.alive ||
+          !room.participants.includes(participant)
+        ) break;
         if (index > 0) await sleep(scaledMs(randomBetween(700, 1_500)));
-        if (room.phase !== "CHAT" || !participant.alive) break;
+        if (
+          participant.speechGeneration !== generation ||
+          room.phase !== "CHAT" ||
+          !participant.alive ||
+          !room.participants.includes(participant)
+        ) break;
         this.publishChat(room, participant.anonName, lines[index] as string);
       }
       if (lines.length > 0) {
@@ -558,8 +786,95 @@ export class GameEngine {
     } catch (error) {
       console.warn(`[AI speech] ${error instanceof Error ? error.message : String(error)}`);
     } finally {
-      this.io.to(room.code).emit("chat:typing", { from: participant.anonName, isTyping: false });
-      participant.speaking = false;
+      if (participant.speechGeneration === generation) {
+        this.io.to(room.code).emit("chat:typing", { isTyping: false });
+        participant.speaking = false;
+      }
+    }
+  }
+
+  private async performForcedAiSpeech(
+    room: Room,
+    participant: Participant,
+    trigger: "interrogated" | "defense"
+  ): Promise<void> {
+    const stillRelevant = (): boolean => trigger === "interrogated"
+      ? room.phase === "CHAT" && room.interrogation?.target === participant.anonName && !room.interrogation.answered
+      : room.phase === "DEFENSE" && room.defenseTarget === participant.anonName && !room.defenseMessageSent;
+    if (!participant.alive || !room.participants.includes(participant) || !stillRelevant()) return;
+
+    // 강제 발화가 시작되면 이미 예약되거나 생성 중인 자연 발화를 무효화한다.
+    const generation = ++participant.speechGeneration;
+    participant.speaking = true;
+    this.io.to(room.code).emit("chat:typing", { isTyping: true });
+    try {
+      const forcedDeadline = Math.min(room.phaseEndsAt ?? Number.POSITIVE_INFINITY, Date.now() + 3_500);
+      const [generated] = await Promise.all([
+        generateAiChat(participant, room, trigger, forcedDeadline),
+        sleep(scaledMs(500))
+      ]);
+      if (
+        participant.speechGeneration !== generation ||
+        !participant.alive ||
+        !room.participants.includes(participant) ||
+        !stillRelevant()
+      ) return;
+      const text = this.postProcessAiText(generated[0] ?? pick(MOCK_LINES));
+      if (!text) return;
+      this.publishChat(room, participant.anonName, text);
+      participant.roundMessageCount += 1;
+      participant.lastSpokeAt = Date.now();
+
+      if (trigger === "interrogated" && room.interrogation) {
+        room.interrogation.answered = true;
+        this.endInterrogation(room, true);
+      } else if (trigger === "defense") {
+        room.defenseMessageSent = true;
+        this.emitRoomState(room);
+      }
+    } catch (error) {
+      console.warn(`[AI forced speech] ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (participant.speechGeneration === generation) {
+        this.io.to(room.code).emit("chat:typing", { isTyping: false });
+        participant.speaking = false;
+      }
+    }
+  }
+
+  private interrogationPayload(room: Room): Record<string, unknown> | undefined {
+    const interrogation = room.interrogation;
+    if (!interrogation) return undefined;
+    return {
+      target: interrogation.target,
+      question: interrogation.question,
+      endsAt: interrogation.endsAt
+    };
+  }
+
+  private endInterrogation(room: Room, answered: boolean): void {
+    const interrogation = room.interrogation;
+    if (!interrogation) return;
+    if (room.interrogationTimer) clearTimeout(room.interrogationTimer);
+    room.interrogationTimer = undefined;
+    room.interrogation = undefined;
+    this.io.to(room.code).emit("interrogation:end", {
+      target: interrogation.target,
+      question: interrogation.question,
+      answered,
+      endedAt: Date.now()
+    });
+    this.emitRoomState(room);
+  }
+
+  private resolveSpectatorBets(room: Room): void {
+    if (room.resolvedBetRounds.has(room.currentRound)) return;
+    room.resolvedBetRounds.add(room.currentRound);
+    for (const human of room.humans.values()) {
+      const targetName = human.spectatorBets.get(room.currentRound);
+      if (!targetName) continue;
+      const target = room.participants.find((participant) => participant.anonName === targetName);
+      if (target && !target.isAI) human.spectatorScore += 1;
     }
   }
 
@@ -630,6 +945,7 @@ export class GameEngine {
       this.emitRoomState(room);
       this.io.to(room.code).emit("vote:reveal", payload);
       if (!room.settings.spectatorMode && room.participants.every((entry) => entry.isAI || !entry.alive)) {
+        this.resolveSpectatorBets(room);
         setTimeout(() => {
           if (room.phase !== "END" && room.participants.every((entry) => entry.isAI || !entry.alive)) {
             this.endGame(room, "AI");
@@ -688,6 +1004,7 @@ export class GameEngine {
       participants: room.participantOrder,
       playerId: human.id,
       rounds: room.settings.rounds,
+      difficulty: room.settings.difficulty,
       round: room.currentRound || 1
     });
   }
@@ -697,6 +1014,9 @@ export class GameEngine {
     if (!human.socketId) return;
     this.io.to(human.socketId).emit("room:state", this.roomState(room, human.id));
     this.io.to(human.socketId).emit("phase:change", this.phasePayload(room));
+    if (room.interrogation) {
+      this.io.to(human.socketId).emit("interrogation:start", this.interrogationPayload(room));
+    }
     for (const chat of room.chats) this.io.to(human.socketId).emit("chat:new", chat);
     if (room.phase === "REVEAL" && room.lastReveal) {
       this.io.to(human.socketId).emit("vote:reveal", room.lastReveal);
@@ -719,7 +1039,8 @@ export class GameEngine {
     return {
       code: room.code,
       players: [...room.humans.values()].map((human) => ({
-        id: human.id,
+        // human.id is the bearer token for room:rejoin. Only its owner may see it.
+        id: human.id === viewerId ? human.id : human.publicId,
         nickname: revealNicknames ? human.nickname : human.id === viewerId ? "나" : "익명 참가자",
         connected: human.connected,
         isHost: room.hostId === human.id,
@@ -729,7 +1050,9 @@ export class GameEngine {
         isYou: human.id === viewerId
       })),
       settings: room.settings,
-      hostId: room.hostId,
+      hostId: room.hostId === viewerId
+        ? room.hostId
+        : room.humans.get(room.hostId)?.publicId ?? "",
       phase: room.phase,
       lifecycle: room.phase === "LOBBY" ? "LOBBY" : room.phase === "END" ? "END" : "PLAYING",
       round: room.currentRound,
@@ -743,7 +1066,17 @@ export class GameEngine {
       messages: room.chats,
       reveal: room.lastReveal,
       result: room.phase === "END" ? this.gameOverPayload(room) : undefined,
-      hasVoted: viewerParticipant ? room.votes.has(viewerParticipant.anonName) : false
+      hasVoted: viewerParticipant ? room.votes.has(viewerParticipant.anonName) : false,
+      defenseTarget: room.phase === "DEFENSE" ? room.defenseTarget : undefined,
+      defenseMessageSent: room.phase === "DEFENSE" ? room.defenseMessageSent : false,
+      interrogationUsed: room.interrogationUsed,
+      interrogation: this.interrogationPayload(room),
+      spectatorBet: viewer?.spectatorBets.has(room.currentRound)
+        ? {
+            round: room.currentRound,
+            targetAnonName: viewer.spectatorBets.get(room.currentRound)
+          }
+        : undefined
     };
   }
 
@@ -752,7 +1085,8 @@ export class GameEngine {
       phase: room.phase,
       endsAt: room.phaseEndsAt ?? Date.now(),
       round: room.currentRound,
-      ...(room.phase === "CHAT" && room.questionCard ? { questionCard: room.questionCard } : {})
+      ...(room.phase === "CHAT" && room.questionCard ? { questionCard: room.questionCard } : {}),
+      ...(room.phase === "DEFENSE" && room.defenseTarget ? { defenseTarget: room.defenseTarget } : {})
     };
   }
 
@@ -776,8 +1110,75 @@ export class GameEngine {
         };
       }),
       spectatorMode: room.settings.spectatorMode,
-      message: room.settings.spectatorMode ? "전원 AI였습니다" : undefined
+      message: room.settings.spectatorMode ? "전원 AI였습니다" : undefined,
+      awards: this.calculateAwards(room),
+      betLeaderboard: [...room.humans.values()]
+        .map((human) => ({ nickname: human.nickname, score: human.spectatorScore, total: human.spectatorBets.size }))
+        .filter((entry) => entry.total > 0)
+        .sort((left, right) => right.score - left.score || left.total - right.total || left.nickname.localeCompare(right.nickname))
     };
+  }
+
+  private calculateAwards(room: Room): GameAward[] {
+    const receivedVotes = new Map<string, number>();
+    const detectiveHits = new Map<string, number>();
+    for (const history of room.voteHistory) {
+      for (const vote of history.items) {
+        receivedVotes.set(vote.target, (receivedVotes.get(vote.target) ?? 0) + 1);
+        const voter = room.participants.find((participant) => participant.anonName === vote.voter);
+        const target = room.participants.find((participant) => participant.anonName === vote.target);
+        if (voter && !voter.isAI && target?.isAI) {
+          detectiveHits.set(voter.anonName, (detectiveHits.get(voter.anonName) ?? 0) + 1);
+        }
+      }
+    }
+
+    const order = (participant: Participant): number => {
+      const index = room.participantOrder.indexOf(participant.anonName);
+      return index < 0 ? Number.MAX_SAFE_INTEGER : index;
+    };
+    const awards: GameAward[] = [];
+    const aiParticipants = room.participants.filter((participant) => participant.isAI);
+    if (aiParticipants.length > 0) {
+      const humanlike = [...aiParticipants].sort((left, right) =>
+        (receivedVotes.get(left.anonName) ?? 0) - (receivedVotes.get(right.anonName) ?? 0) || order(left) - order(right)
+      )[0] as Participant;
+      const votes = receivedVotes.get(humanlike.anonName) ?? 0;
+      awards.push({
+        id: "humanlike_ai",
+        title: "가장 인간 같았던 AI",
+        recipient: humanlike.anonName,
+        detail: `누적 ${votes}표만 받고 인간 행세에 성공`
+      });
+    }
+
+    const humanParticipants = room.participants.filter((participant) => !participant.isAI);
+    if (humanParticipants.length > 0) {
+      const suspected = [...humanParticipants].sort((left, right) =>
+        (receivedVotes.get(right.anonName) ?? 0) - (receivedVotes.get(left.anonName) ?? 0) || order(left) - order(right)
+      )[0] as Participant;
+      const votes = receivedVotes.get(suspected.anonName) ?? 0;
+      awards.push({
+        id: "most_suspected_human",
+        title: "가장 의심받은 인간",
+        recipient: suspected.anonName,
+        detail: `인간인데 누적 ${votes}표를 받음`
+      });
+
+      const detective = [...humanParticipants].sort((left, right) =>
+        (detectiveHits.get(right.anonName) ?? 0) - (detectiveHits.get(left.anonName) ?? 0) || order(left) - order(right)
+      )[0] as Participant;
+      const hits = detectiveHits.get(detective.anonName) ?? 0;
+      if (hits > 0) {
+        awards.push({
+          id: "detective",
+          title: "명탐정",
+          recipient: detective.realNickname ?? detective.anonName,
+          detail: `AI를 ${hits}번 정확히 지목`
+        });
+      }
+    }
+    return awards;
   }
 
   private nextQuestion(room: Room): string {
@@ -798,7 +1199,8 @@ export class GameEngine {
     room.scheduledAiStarts = [];
     for (const participant of room.participants) {
       if (participant.speaking) {
-        this.io.to(room.code).emit("chat:typing", { from: participant.anonName, isTyping: false });
+        participant.speechGeneration += 1;
+        this.io.to(room.code).emit("chat:typing", { isTyping: false });
         participant.speaking = false;
       }
     }
@@ -807,18 +1209,24 @@ export class GameEngine {
   private clearPhaseWork(room: Room): void {
     if (room.phaseTimer) clearTimeout(room.phaseTimer);
     room.phaseTimer = undefined;
+    if (room.interrogationTimer) clearTimeout(room.interrogationTimer);
+    room.interrogationTimer = undefined;
+    room.interrogation = undefined;
     this.stopAiScheduler(room);
   }
 
   private createHuman(nickname: string, socket: GameSocket): HumanPlayer {
     return {
       id: randomUUID(),
+      publicId: `public:${randomUUID()}`,
       nickname,
       socketId: socket.id,
       connected: true,
       joinedAt: Date.now(),
       isSpectator: false,
-      alive: true
+      alive: true,
+      spectatorScore: 0,
+      spectatorBets: new Map()
     };
   }
 
@@ -889,19 +1297,29 @@ export class GameEngine {
         now - room.lastActivityAt >= ROOM_IDLE_TTL;
       if (!absoluteExpired && !idleExpired) continue;
 
+      const reason = absoluteExpired
+        ? "방의 최대 이용 시간이 지나 종료되었습니다"
+        : "오랫동안 활동이 없어 방이 종료되었습니다";
       this.io.to(room.code).emit("error", {
-        message: absoluteExpired
-          ? "방의 최대 이용 시간이 지나 종료되었습니다"
-          : "오랫동안 활동이 없어 방이 종료되었습니다"
+        message: reason
       });
-      this.destroyRoom(room);
+      this.destroyRoom(room, reason);
     }
   }
 
-  private destroyRoom(room: Room): void {
+  private destroyRoom(room: Room, reason = "방이 종료되었습니다"): void {
     this.clearPhaseWork(room);
     for (const human of room.humans.values()) {
       if (human.disconnectTimer) clearTimeout(human.disconnectTimer);
+      if (!human.socketId) continue;
+      const socket = this.io.sockets.sockets.get(human.socketId);
+      if (!socket) continue;
+      socket.emit("room:closed", { code: room.code, reason });
+      if (socket.data.roomCode === room.code && socket.data.playerId === human.id) {
+        socket.data.roomCode = undefined;
+        socket.data.playerId = undefined;
+      }
+      void socket.leave(room.code);
     }
     this.rooms.delete(room.code);
   }
