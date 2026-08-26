@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import cors from "cors";
 import express from "express";
 import { Server } from "socket.io";
+import { getAiRuntimeStatus } from "./ai.js";
 import { REPOSITORY_ROOT } from "./env.js";
 import { GameEngine } from "./game.js";
 import type { Ack, GameSocket } from "./types.js";
@@ -14,7 +15,7 @@ app.use(cors());
 app.use(express.json({ limit: "32kb" }));
 
 app.get("/health", (_request, response) => {
-  response.status(200).json({ ok: true });
+  response.status(200).json({ ok: true, ai: getAiRuntimeStatus() });
 });
 
 const clientDist = resolve(REPOSITORY_ROOT, "client", "dist");
@@ -285,7 +286,8 @@ io.on("connection", (socket: GameSocket) => {
 const port = Number.parseInt(process.env.PORT ?? "3000", 10);
 httpServer.listen(Number.isFinite(port) ? port : 3000, "0.0.0.0", () => {
   console.log(`인간을 찾아라 server listening on :${Number.isFinite(port) ? port : 3000}`);
-  console.log(process.env.OPENAI_API_KEY ? `OpenAI model: ${process.env.OPENAI_MODEL || "gpt-4o-mini"}` : "AI mode: mock");
+  const ai = getAiRuntimeStatus();
+  console.log(ai.mode === "luna" ? `OpenAI model: ${ai.model}` : "AI mode: mock");
 });
 
 const shutdown = (): void => {

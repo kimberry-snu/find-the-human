@@ -35,9 +35,9 @@
 
 - 클라이언트: React 18, Vite, TypeScript, Tailwind CSS
 - 서버: Node.js, Express, Socket.io, TypeScript
-- AI: OpenAI Chat Completions API (`OPENAI_MODEL`, 기본 `gpt-4o-mini`)
+- AI: OpenAI Chat Completions API (`OPENAI_MODEL`, 기본 `gpt-5.6-luna`)
 - 상태 저장: 서버 프로세스의 `Map`에 보관하는 인메모리 상태
-- 배포: Express가 빌드된 `client/dist`를 함께 제공하는 Railway 단일 Node 프로세스
+- 배포: Express가 빌드된 `client/dist`를 함께 제공하는 Render 단일 Node 프로세스
 
 ```text
 브라우저 (React/Vite)
@@ -55,18 +55,18 @@ Express + Socket.io 서버 (authoritative state machine)
 
 ### AI 에이전트 흐름
 
-각 AI는 게임마다 중복되지 않는 성인 페르소나를 받고, 최근 채팅 30개와 현재 질문 카드를 바탕으로 한 문장짜리 반말을 생성합니다. CHAT 중 3초마다 생존 AI의 발화 여부를 평가합니다.
+각 AI는 게임마다 중복되지 않는 성인 페르소나를 받고, 최근 채팅 16개와 현재 질문 카드를 바탕으로 한 문장짜리 반말을 생성합니다. CHAT 중 3초마다 생존 AI의 발화 여부를 평가합니다.
 
-- 기본 발화 확률 25%, 최근 5개 메시지에서 지목되면 80%, 질문 카드에 답하지 않았으면 60%
+- 한 틱에 AI 한 명만 선택하고, 최근 직접 지목 → 질문 미응답 → 자연 발화 순으로 우선
 - 15초 이상 조용하면 AI 한 명을 강제로 선택
-- AI별 직전 발화 후 8초 cooldown, 라운드당 최소 2회·최대 6회
-- 선택 후 1.5~6초간 익명 `chat:typing`, 여러 AI의 시작은 최소 2초 간격. 입력 중인 참가자의 이름은 AI 정체를 누출하지 않도록 보내지 않음
-- 응답은 최대 30자로 후처리하고 15% 확률로 오타를 넣으며, 두 줄이면 0.7~1.5초 간격으로 나눠 전송
+- AI별 직전 발화 후 8초 cooldown, 라운드당 최대 6회. 라운드 종료 시 목업 문장으로 최소 횟수를 강제하지 않음
+- 방마다 AI 한 명만 생성·입력하고, AI 발화 뒤 최소 5초를 둠. `chat:typing`에는 이름을 보내지 않아 AI 정체 노출을 막음
+- 응답은 최대 30자 한 메시지로 후처리하고, 최근 16개 메시지와 같은·유사한 표현은 문맥형 대체 답변으로 교체
 - 순한맛 투표는 약 30% 랜덤·45% 발화량 휴리스틱·25% 모델 추리, 매운맛은 약 15%·25%·60%로 동작
 - 모델 투표는 채팅 생성과 분리된 JSON structured output 호출로 `{ target, reason }`을 받음
 - 심문당한 AI와 최다 득표 AI는 일반 발화 확률을 기다리지 않고 짧은 반말 답변·변론을 강제로 생성
 
-OpenAI 호출에는 기본적으로 temperature `1.1`, max tokens `60`을 사용합니다. 단, 기본 temperature만 허용하는 GPT-5.6 계열은 `1`을 사용합니다. 키가 없거나 호출·검증이 실패하면 아래의 mock 경로로 즉시 이어집니다.
+공개 서버는 `gpt-5.6-luna`를 사용하며, 짧은 실시간 대화에 맞춰 출력 토큰과 최근 대화 문맥을 제한합니다. 키가 없거나 호출·검증이 실패하거나 서버 비용·트래픽 제한에 도달하면 게임을 멈추지 않고 아래의 mock 경로로 이어집니다.
 
 ## 로컬 실행
 
@@ -115,13 +115,19 @@ npm start
 | 이름 | 필수 여부 | 기본값 | 설명 |
 | --- | --- | --- | --- |
 | `OPENAI_API_KEY` | 선택 | 빈 값 | 값이 없으면 mock 모드. 값이 있으면 실제 Chat Completions 호출 |
-| `OPENAI_MODEL` | 선택 | `gpt-4o-mini` | AI 채팅과 투표에 사용할 모델 |
-| `PORT` | 선택 | `3000` | Express/Socket.io 수신 포트. Railway가 배포 시 주입 |
+| `OPENAI_MODEL` | 선택 | `gpt-5.6-luna` | AI 채팅과 투표에 사용할 모델 |
+| `OPENAI_DAILY_BUDGET_USD` | 선택 | `0.50` | UTC 하루 동안 이 서버 프로세스가 허용할 OpenAI 예상 비용(USD) |
+| `OPENAI_ROOM_DAILY_BUDGET_USD` | 선택 | `0.05` | 방 하나가 UTC 하루 동안 사용할 수 있는 예상 비용(USD) |
+| `OPENAI_REQUESTS_PER_MINUTE` | 선택 | `30` | 서버 프로세스 전체의 OpenAI 분당 요청 수 제한 |
+| `OPENAI_MAX_CONCURRENCY` | 선택 | `2` | 동시에 진행할 수 있는 OpenAI 요청 수 제한 |
+| `PORT` | 선택 | `3000` | Express/Socket.io 수신 포트. Render 등 배포 플랫폼이 주입 |
 | `CLIENT_ORIGIN` | 선택 | 빈 값 | 분리 배포 시 허용할 브라우저 Origin. 여러 값은 쉼표로 구분 |
 | `GAME_TIME_SCALE` | 테스트 전용 | `1` | 페이즈·AI·재접속 타이머 배율. 실제 배포에서는 `1` 유지 |
 | `RATE_LIMIT_DISABLED` | E2E 전용 | 빈 값 | `1`이면 요청 제한 해제. 공개 배포에서는 설정 금지 |
 
 `.env`는 Git에서 제외됩니다. API 키를 클라이언트 변수나 브라우저 코드에 넣지 마세요.
+
+비용 제한은 게임 서버가 토큰 사용량을 기준으로 집계하는 **프로세스 메모리 내 안전장치**입니다. UTC 날짜가 바뀌거나 프로세스가 재시작되면 집계가 초기화되며, 인스턴스를 여러 개 띄우면 각 인스턴스가 별도로 계산합니다. 따라서 계정 전체의 절대 한도로 보지 말고 OpenAI Platform의 프로젝트 결제 한도·사용량 알림도 별도로 설정하세요. 제한에 도달한 동안 새 모델 호출은 mock 응답으로 전환되어 진행 중인 게임은 계속됩니다.
 
 ## Mock 모드
 
@@ -129,37 +135,50 @@ npm start
 
 ```dotenv
 OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o-mini
+OPENAI_MODEL=gpt-5.6-luna
+OPENAI_DAILY_BUDGET_USD=0.50
+OPENAI_ROOM_DAILY_BUDGET_USD=0.05
+OPENAI_REQUESTS_PER_MINUTE=30
+OPENAI_MAX_CONCURRENCY=2
 PORT=3000
 ```
 
-mock 모드에서도 AI 발화 판단, typing 지연, 메시지 분할, 투표, 리빌, 라운드 진행과 최종 결과까지 전체 흐름이 동작합니다. 실제 API 호출도 최대 두 차례 재시도한 뒤 실패하면 같은 mock 경로로 폴백하므로 외부 장애가 게임 상태 머신을 멈추지 않습니다.
+mock 모드에서도 AI 발화 판단, typing 지연, 투표, 리빌, 라운드 진행과 최종 결과까지 전체 흐름이 동작합니다. 실제 API 호출은 지연과 중복 비용을 막기 위해 한 번만 시도하고, 실패하면 즉시 질문·페르소나·최근 발화에 맞는 대체 답변으로 이어집니다.
 
-## Railway 배포
+## Render 배포
 
-이 저장소는 루트의 `railway.json`으로 단일 서비스 배포를 구성합니다.
+공개 데모는 Render Web Service 한 개가 정적 클라이언트와 Socket.IO/OpenAI 서버를 함께 제공합니다.
 
-1. GitHub 저장소를 Railway 새 프로젝트의 서비스에 연결합니다.
+1. GitHub 저장소를 Render 새 Web Service에 연결합니다.
 2. 서비스의 Root Directory는 저장소 루트로 둡니다.
-3. 첫 공개 데모는 `OPENAI_API_KEY`를 등록하지 않은 mock 모드가 안전합니다. 실제 AI를 쓸 때만 서버 Variables에 `OPENAI_API_KEY`, 필요하면 `OPENAI_MODEL`을 등록합니다. `PORT`는 Railway가 자동 주입하므로 직접 고정하지 않는 편이 좋습니다.
-4. 배포하면 Railway가 `npm install --include=dev && npm run build`를 실행하고 `npm start`로 서버 하나를 시작합니다.
-5. **Generate Domain**으로 공개 도메인을 만든 뒤 `/health`가 성공하는지 확인합니다.
+3. Build Command는 `npm install --include=dev && npm run build`, Start Command는 `npm start`로 설정합니다.
+4. Environment에 `OPENAI_API_KEY`와 아래 공개 서버 권장값을 등록합니다. API 키는 Render 서버 환경에만 두고 GitHub Pages나 `VITE_` 변수에는 절대 넣지 않습니다.
 
-API 키 없이 배포하면 공개 데모용 mock 모드로 그대로 동작합니다. 공개 서버는 IP별 연결·방 생성·참가 속도를 제한하고 채팅 제한은 참가자별로 분리합니다. 방은 최대 10명, 서버 전체는 최대 100개 방을 유지합니다. 로비/종료 방은 15분 무활동 시, 모든 방은 최대 2시간 후 정리됩니다. 방과 플레이어 정보는 메모리에만 있으므로 호스팅 인스턴스는 반드시 1개로 유지해야 합니다. 재배포나 프로세스 재시작 시 진행 중인 방은 복구되지 않습니다.
+   ```dotenv
+   OPENAI_MODEL=gpt-5.6-luna
+   OPENAI_DAILY_BUDGET_USD=0.50
+   OPENAI_ROOM_DAILY_BUDGET_USD=0.05
+   OPENAI_REQUESTS_PER_MINUTE=30
+   OPENAI_MAX_CONCURRENCY=2
+   ```
+
+5. 인스턴스 수를 1개로 유지한 채 배포하고, 공개 주소의 `GET /health`에서 비밀값 없이 현재 AI 모드와 예산 상태를 확인합니다.
+
+API 키 없이 배포하면 공개 데모용 mock 모드로 그대로 동작합니다. 키가 있어도 일일 비용·분당 요청·동시 요청 제한에 도달하면 호출만 mock으로 폴백합니다. 공개 서버는 IP별 연결·방 생성·참가 속도를 제한하고 채팅 제한은 참가자별로 분리합니다. 방은 최대 10명, 서버 전체는 최대 100개 방을 유지합니다. 로비/종료 방은 15분 무활동 시, 모든 방은 최대 2시간 후 정리됩니다. 방과 플레이어 정보와 OpenAI 비용 집계는 메모리에만 있으므로 호스팅 인스턴스는 반드시 1개로 유지해야 합니다. 재배포나 프로세스 재시작 시 진행 중인 방과 일일 집계는 복구되지 않습니다.
 
 ## 현재 공개 데모
 
 - 전체 앱: [find-the-human-kimberry.onrender.com](https://find-the-human-kimberry.onrender.com/)
 - GitHub Pages 클라이언트: [kimberry-snu.github.io/find-the-human](https://kimberry-snu.github.io/find-the-human/)
 
-Render 무료 Web Service는 일정 시간 요청이 없으면 휴면하므로 첫 접속이 늦을 수 있습니다. 두 주소는 같은 Socket.io 서버를 사용하며, 공개 서버는 비용 사고를 막기 위해 기본적으로 OpenAI 키 없는 Mock AI 모드로 운영합니다.
+Render 무료 Web Service는 일정 시간 요청이 없으면 휴면하므로 첫 접속이 늦을 수 있습니다. 두 주소는 같은 Socket.io 서버를 사용합니다. 공개 서버의 실제 Luna 연결 여부와 현재 프로세스 예산 상태는 [`/health`](https://find-the-human-kimberry.onrender.com/health)에서 확인할 수 있습니다.
 
 ## GitHub Pages 배포
 
-GitHub Pages에는 `client/dist` 정적 프런트만 배포됩니다. Socket.IO 게임 상태와 OpenAI 호출은 Node 서버에서 실행되므로, 전체 멀티플레이를 사용하려면 Railway 등 HTTPS/WSS가 가능한 곳에 서버도 배포해야 합니다.
+GitHub Pages에는 `client/dist` 정적 프런트만 배포됩니다. Socket.IO 게임 상태와 OpenAI 호출은 Node 서버에서 실행되므로, 전체 멀티플레이를 사용하려면 Render 등 HTTPS/WSS가 가능한 곳에 서버도 배포해야 합니다.
 
 1. GitHub 저장소의 **Settings → Pages → Source**를 **GitHub Actions**로 설정합니다.
-2. **Settings → Secrets and variables → Actions → Variables**에 `VITE_SOCKET_URL`을 만들고 공개 Node 서버 주소(예: `https://example.up.railway.app`)를 입력합니다.
+2. **Settings → Secrets and variables → Actions → Variables**에 `VITE_SOCKET_URL`을 만들고 공개 Node 서버 주소(예: `https://example.onrender.com`)를 입력합니다.
 3. `main` 브랜치에 push하거나 **Actions → Deploy client to GitHub Pages → Run workflow**를 실행합니다.
 
 워크플로는 저장소 이름으로 Vite base path를 자동 계산하므로 프로젝트 Pages의 `/저장소명/` 경로에서도 정적 자산이 정상 로드됩니다. `VITE_SOCKET_URL`은 브라우저에 포함되는 공개 주소일 뿐 비밀값이 아닙니다. `OPENAI_API_KEY`는 반드시 Node 서버의 환경 변수에만 등록하고 GitHub Pages 변수나 클라이언트 코드에는 넣지 마세요.
@@ -217,10 +236,10 @@ GitHub Pages에는 `client/dist` 정적 프런트만 배포됩니다. Socket.IO 
 - 연결이 끊긴 인간은 60초 동안 자리를 보존합니다. 그 안에 `room:rejoin`하면 이어서 참여하고, 초과하면 자동 추방·정체 공개 후 기존 `playerId`를 만료시킵니다. 같은 사용자가 다시 들어오려면 일반 `room:join`으로 새 관전자 세션을 받아야 합니다.
 - 공개된 추방 정체는 게임 내 이력으로 누적해 재접속 스냅샷에서도 복원합니다. 여러 자동 추방이 동시에 발생하면 클라이언트가 공개 카드를 큐로 순차 재생합니다.
 - 방장이 나가면 현재 연결된 다음 인간에게 방장 권한을 넘깁니다. 인메모리 구조이므로 서버 재시작을 넘는 재접속은 지원하지 않습니다.
-- OpenAI 키가 없거나 응답이 실패·지연·형식 오류인 경우 mock 응답을 사용합니다. 전송 오류는 최초 요청과 두 번의 재시도까지만 허용하고 페이즈 마감에 맞춰 취소합니다. AI 투표 대상이 유효하지 않으면 한 번 다시 요청하고, 다시 실패하면 가능한 대상 중 무작위로 투표합니다.
-- Chat Completions의 현재 토큰 제한 필드인 `max_completion_tokens: 60`을 사용하고, AI 투표는 엄격한 `json_schema` Structured Output으로 받습니다. 요청된 기본 모델 `gpt-4o-mini`는 그대로 유지합니다.
-- AI의 답변은 최대 30자로 정리하고, 두 줄은 두 메시지로 나눕니다. 15% 오타 주입과 1.5~6초 typing 지연을 적용하되 단계가 바뀌면 예약된 채팅을 폐기합니다.
-- Mock 질문 답변도 20개 카드의 의미에 맞춰 생성하며, 일부 응답은 두 줄로 만들어 API 키 없이도 메시지 분할 경로를 실행합니다.
+- OpenAI 키가 없거나 응답이 실패·지연·형식 오류인 경우 문맥형 대체 응답을 사용합니다. 외부 호출은 한 번만 시도하고 페이즈 마감에 맞춰 취소하며, AI 투표가 유효하지 않으면 가능한 대상 중 무작위로 투표합니다.
+- Chat Completions는 `gpt-5.6-luna`, `reasoning_effort: none`, `developer` 메시지와 제한된 `max_completion_tokens`를 사용합니다. 투표는 엄격한 `json_schema` Structured Output으로 받습니다. 짧은 문맥·출력 제한과 서버·방 단위 일일 비용, 분당 요청 수, 동시 요청 수 제한으로 공개 트래픽 비용을 방어합니다.
+- AI의 답변은 최대 30자 한 메시지로 정리하고 15% 오타 주입과 1.5~6초 typing 지연을 적용하되, 단계가 바뀌면 예약된 채팅을 폐기합니다.
+- Mock 질문 답변도 20개 카드와 각 페르소나의 관심사·직업에 맞는 여러 후보 중 최근 대화와 겹치지 않는 표현을 고릅니다.
 - 리빌 목록은 모바일 내부 스크롤과 자동 이동을 사용하고, 참가자가 많으면 서버가 0.8초 공개 간격에 맞춰 REVEAL 시간을 15초보다 길게 자동 확장합니다.
 - 프로덕션은 한 Node 프로세스가 정적 SPA와 Socket.io를 함께 제공해 별도 CORS 설정이나 두 서비스 간 배포 순서 문제를 만들지 않습니다.
 
@@ -267,11 +286,12 @@ npm run build
 - 방장 이탈 시 권한 위임
 - 연결 해제 후 60초 안 재접속 및 60초 초과 자동 추방
 - 게임 도중 참가자의 자동 관전자 전환
-- OpenAI 오류 시 재시도 뒤 mock 폴백
+- OpenAI 오류·비용 제한 시 즉시 문맥형 폴백
 - 개발자 도구의 375px 너비에서 홈, 로비, 게임, 투표, 리빌, 결과 화면의 가로 넘침 여부
 
 ## 알려진 운영 제약
 
 - 데이터베이스가 없어 서버 재시작·재배포 시 방과 게임 상태가 사라집니다.
+- OpenAI 비용 카운터도 서버 메모리에만 있어 재시작하면 초기화됩니다. 계정·프로젝트 단위 결제 한도와 사용량 알림을 별도로 설정해야 합니다.
 - 여러 프로세스나 replica 사이의 상태 공유가 없으므로 수평 확장을 지원하지 않습니다.
 - 초대 코드는 짧고 공개 데모를 위한 값이며 인증이나 비공개 로비 보안 수단이 아닙니다.

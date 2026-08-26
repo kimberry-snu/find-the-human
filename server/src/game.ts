@@ -46,6 +46,8 @@ const AI_TICK = 3_000;
 const AI_COOLDOWN = 8_000;
 const SILENCE_THRESHOLD = 15_000;
 const AI_START_GAP = 2_000;
+const AI_TURN_GAP = 5_000;
+const DIRECT_MENTION_WINDOW = 30_000;
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const MAX_ROOMS = 100;
 const MAX_ROOM_OCCUPANTS = 10;
@@ -695,24 +697,58 @@ export class GameEngine {
     if (room.phase !== "CHAT") return;
     const now = Date.now();
     const remaining = Math.max(0, (room.phaseEndsAt ?? now) - now);
-    const recent = room.chats.slice(-5);
-    let eligible = room.participants.filter((participant) =>
+
+    // 한 번에 여러 생성 요청이 시작되면 대화가 아니라 AI 답변 목록처럼 보인다.
+    // 예약 대기까지 speaking에 포함되므로 방마다 자연 발화는 하나씩만 진행한다.
+    if (room.participants.some((participant) => participant.isAI && participant.speaking)) return;
+
+    const latestMessage = room.chats.at(-1);
+    const latestSpeaker = latestMessage
+      ? room.participants.find((participant) => participant.anonName === latestMessage.from)
+      : undefined;
+    if (
+      latestMessage &&
+      latestSpeaker?.isAI &&
+      now - latestMessage.ts < scaledMs(AI_TURN_GAP)
+    ) return;
+
+    const recent = room.chats.slice(-8);
+    const eligible = room.participants.filter((participant) =>
       participant.isAI && participant.alive && !participant.speaking && participant.roundMessageCount < 6 &&
       now - participant.lastSpokeAt >= scaledMs(AI_COOLDOWN)
     );
     if (eligible.length === 0) return;
 
     const silenceForced = now - room.lastChatAt >= scaledMs(SILENCE_THRESHOLD);
-    const forcedAi = silenceForced ? pick(eligible) : undefined;
-    eligible = shuffle(eligible);
-    for (const ai of eligible) {
-      const mentioned = recent.some((message) => message.text.includes(ai.anonName));
-      const trigger = !ai.answeredQuestion ? "question" : mentioned ? "mentioned" : "natural";
-      let probability = mentioned ? 0.8 : !ai.answeredQuestion ? 0.6 : 0.25;
-      if (remaining <= scaledMs(15_000) && !ai.answeredQuestion) probability = 1;
-      if (remaining <= scaledMs(CHAT_DURATION / 2) && ai.roundMessageCount < 2) probability = 1;
-      if (ai === forcedAi || Math.random() < probability) this.scheduleAiSpeech(room, ai, trigger);
-    }
+    const mentionCutoff = now - scaledMs(DIRECT_MENTION_WINDOW);
+    const ranked = shuffle(eligible).map((ai) => {
+      const latestMention = [...recent].reverse().find((message) =>
+        message.from !== ai.anonName &&
+        message.ts > Math.max(ai.lastSpokeAt, mentionCutoff) &&
+        message.text.includes(ai.anonName)
+      );
+      return {
+        ai,
+        mentionedAt: latestMention?.ts ?? 0,
+        priority: latestMention ? 2 : !ai.answeredQuestion ? 1 : 0
+      };
+    }).sort((left, right) =>
+      right.priority - left.priority ||
+      right.mentionedAt - left.mentionedAt ||
+      left.ai.roundMessageCount - right.ai.roundMessageCount ||
+      left.ai.lastSpokeAt - right.ai.lastSpokeAt
+    );
+
+    const selected = ranked[0];
+    if (!selected) return;
+    const trigger = selected.priority === 2
+      ? "mentioned"
+      : !selected.ai.answeredQuestion
+        ? "question"
+        : "natural";
+    let probability = trigger === "mentioned" ? 1 : trigger === "question" ? 0.65 : 0.2;
+    if (silenceForced || (remaining <= scaledMs(15_000) && trigger === "question")) probability = 1;
+    if (Math.random() < probability) this.scheduleAiSpeech(room, selected.ai, trigger);
   }
 
   private scheduleAiSpeech(room: Room, participant: Participant, trigger: "natural" | "question" | "mentioned"): void {
@@ -760,7 +796,14 @@ export class GameEngine {
         !participant.alive ||
         !room.participants.includes(participant)
       ) return;
-      const lines = generated.slice(0, 2).map((line) => this.postProcessAiText(line)).filter(Boolean);
+      const acceptedKeys = new Set<string>();
+      const lines = generated.slice(0, 2).map((line) => this.postProcessAiText(line)).filter((line) => {
+        if (!line || this.isRecentRepeat(room, line)) return false;
+        const key = this.normalizedChatText(line);
+        if (!key || [...acceptedKeys].some((accepted) => this.chatKeysRepeat(accepted, key))) return false;
+        acceptedKeys.add(key);
+        return true;
+      });
       this.io.to(room.code).emit("chat:typing", { isTyping: false });
       for (let index = 0; index < lines.length; index += 1) {
         if (
@@ -782,6 +825,9 @@ export class GameEngine {
         participant.roundMessageCount += 1;
         participant.lastSpokeAt = Date.now();
         if (trigger === "question") participant.answeredQuestion = true;
+      } else {
+        // 중복 출력을 버린 직후 같은 요청을 다시 보내는 비용/반복 루프를 막는다.
+        participant.lastSpokeAt = Date.now();
       }
     } catch (error) {
       console.warn(`[AI speech] ${error instanceof Error ? error.message : String(error)}`);
@@ -879,19 +925,66 @@ export class GameEngine {
   }
 
   private ensureAiObligations(room: Room): void {
-    for (const ai of room.participants.filter((participant) => participant.isAI && participant.alive)) {
-      if (!ai.answeredQuestion && ai.roundMessageCount < 6) {
-        this.publishChat(room, ai.anonName, mockQuestionAnswer(ai, room.questionCard));
-        ai.answeredQuestion = true;
-        ai.roundMessageCount += 1;
-        ai.lastSpokeAt = Date.now();
-      }
-      while (ai.roundMessageCount < 2) {
-        this.publishChat(room, ai.anonName, pick(MOCK_LINES));
-        ai.roundMessageCount += 1;
-        ai.lastSpokeAt = Date.now();
-      }
+    const aliveAis = room.participants.filter((participant) => participant.isAI && participant.alive);
+    // 누군가 이미 질문에 답했다면 라운드 종료 순간에 메시지를 억지로 끼워 넣지 않는다.
+    if (aliveAis.some((ai) => ai.answeredQuestion)) return;
+
+    const ai = shuffle(aliveAis).sort((left, right) =>
+      left.roundMessageCount - right.roundMessageCount || left.lastSpokeAt - right.lastSpokeAt
+    )[0];
+    if (!ai || ai.roundMessageCount > 0) return;
+
+    const fallback = this.contextualQuestionFallback(room, ai);
+    if (!fallback) return;
+    this.publishChat(room, ai.anonName, fallback);
+    ai.answeredQuestion = true;
+    ai.roundMessageCount += 1;
+    ai.lastSpokeAt = Date.now();
+  }
+
+  private contextualQuestionFallback(room: Room, participant: Participant): string | undefined {
+    const card = room.questionCard ?? "";
+    const persona = participant.persona;
+    const interest = persona?.interests.split(",")[0]?.trim();
+    const job = persona?.job.split(",")[0]?.trim();
+    let profileAnswer: string | undefined;
+
+    if (interest && card.includes("사진")) profileAnswer = `${interest} 찍은거`;
+    else if (interest && card.includes("검색")) profileAnswer = `${interest} 검색했지`;
+    else if (interest && card.includes("스트레스")) profileAnswer = `${interest} 하면서 품`;
+    else if (job && (card.includes("카톡") || card.includes("오래 얘기"))) profileAnswer = `${job} 사람이랑`;
+    else if (persona && (card.includes("아침") || card.includes("일어났"))) {
+      profileAnswer = `${6 + (persona.age % 5)}시쯤 일어남`;
     }
+
+    for (const raw of [profileAnswer, mockQuestionAnswer(participant, room.questionCard)]) {
+      if (!raw || this.isRecentRepeat(room, raw)) continue;
+      const processed = this.postProcessAiText(raw);
+      if (processed && !this.isRecentRepeat(room, processed)) return processed;
+    }
+    return undefined;
+  }
+
+  private normalizedChatText(text: string): string {
+    return text
+      .toLocaleLowerCase("ko-KR")
+      .replace(/[ㅋㅎㅠㅜ]+/g, "")
+      .replace(/[^\p{L}\p{N}]+/gu, "");
+  }
+
+  private isRecentRepeat(room: Room, text: string): boolean {
+    const candidate = this.normalizedChatText(text);
+    if (!candidate) return true;
+    return room.chats.slice(-16).some((message) => {
+      const previous = this.normalizedChatText(message.text);
+      return previous ? this.chatKeysRepeat(previous, candidate) : false;
+    });
+  }
+
+  private chatKeysRepeat(left: string, right: string): boolean {
+    if (left === right) return true;
+    const [shorter, longer] = left.length <= right.length ? [left, right] : [right, left];
+    return shorter.length >= 4 && longer.length - shorter.length <= 2 && longer.includes(shorter);
   }
 
   private postProcessAiText(raw: string): string {
