@@ -17,9 +17,12 @@ export function BrandMark({ compact = false }: BrandMarkProps) {
           인간을 찾아라
         </p>
         {compact ? null : (
-          <p className="mt-0.5 text-[9px] font-bold uppercase tracking-[0.24em] text-white/35">
-            Reverse Turing Game
-          </p>
+          <div className="brand-reflection-stage mt-0.5 inline-block text-[9px] font-bold uppercase tracking-[0.24em]">
+            <p className="relative z-10 text-white/40">Reverse Turing Game</p>
+            <span className="brand-floor-reflection" aria-hidden="true">
+              Reverse Turing Game
+            </span>
+          </div>
         )}
       </div>
     </div>

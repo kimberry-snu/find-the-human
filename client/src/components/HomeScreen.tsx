@@ -62,9 +62,11 @@ export function HomeScreen({
           AI 사이에 인간이 숨어 있다
         </div>
         <h1 className="max-w-[330px] text-[42px] font-black leading-[1.04] tracking-[-0.065em] text-white sm:text-5xl">
-          사람처럼 말고,
+          살아남기 위해,
           <br />
-          <span className="text-white/30">AI처럼 살아남아.</span>
+          <span className="bg-gradient-to-r from-electric-soft via-white to-electric bg-clip-text text-transparent drop-shadow-[0_0_22px_rgba(103,232,213,0.14)]">
+            AI를 연기하라
+          </span>
         </h1>
         <p className="mt-5 max-w-[330px] text-[13px] font-medium leading-6 text-white/45">
           익명 채팅 속 진짜 인간을 지목하는 역튜링 심리전.
